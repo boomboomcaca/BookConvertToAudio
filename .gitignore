@@ -8,3 +8,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# 任务状态文件
+task_state.json
+
