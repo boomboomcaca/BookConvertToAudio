@@ -5,6 +5,8 @@ import torch
 import torchaudio
 import time
 import subprocess
+import threading
+import json
 from datetime import datetime
 
 # 设置环境路径
@@ -25,10 +27,26 @@ os.environ["DS_BUILD_OPS"] = "0"
 # 全局模型变量
 cosyvoice_model = None
 
+# 停止标志
+stop_flag = threading.Event()
+current_inference_thread = None
+# 后台任务线程
+background_task_thread = None
+
 # 资源目录
 ASSETS_DIR = os.path.join(current_dir, 'assets')
 if not os.path.exists(ASSETS_DIR):
     os.makedirs(ASSETS_DIR)
+
+# 输出目录（生成的文件保存到这里）
+OUTPUT_DIR = os.path.join(current_dir, 'output')
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# 任务状态文件
+TASK_STATE_FILE = os.path.join(current_dir, 'task_state.json')
+# 文件I/O锁，防止并发写入导致文件损坏
+task_state_lock = threading.Lock()
 
 def get_reference_audio_list():
     """扫描 assets 目录下的音频文件"""
@@ -84,53 +102,212 @@ def load_model():
             return f"Error loading model: {str(e)}"
     return "Model already loaded."
 
-def convert_book(text_files, ref_audio_name, prompt_text, progress=gr.Progress(track_tqdm=True)):
-    global cosyvoice_model
+def save_task_state(state):
+    """保存任务状态到JSON文件（线程安全）"""
+    global task_state_lock
+    try:
+        with task_state_lock:
+            # 使用临时文件+原子重命名，确保写入的原子性
+            temp_file = TASK_STATE_FILE + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            # 原子重命名（在POSIX系统上是原子操作）
+            os.replace(temp_file, TASK_STATE_FILE)
+    except Exception as e:
+        print(f"Failed to save task state: {e}")
+
+def load_task_state():
+    """从JSON文件加载任务状态（线程安全）"""
+    global task_state_lock
+    try:
+        with task_state_lock:
+            if os.path.exists(TASK_STATE_FILE):
+                with open(TASK_STATE_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+    except Exception as e:
+        print(f"Failed to load task state: {e}")
+    return None
+
+def clear_task_state():
+    """清除任务状态文件（线程安全）"""
+    global task_state_lock
+    try:
+        with task_state_lock:
+            if os.path.exists(TASK_STATE_FILE):
+                os.remove(TASK_STATE_FILE)
+    except Exception as e:
+        print(f"Failed to clear task state: {e}")
+
+def get_task_status():
+    """获取当前任务状态（用于界面刷新）"""
+    state = load_task_state()
+    if not state:
+        return "暂无运行中的任务", None
     
-    # 1. 检查模型状态
-    if cosyvoice_model is None:
-        progress(0, desc="Loading model...")
-        yield "Loading model...", None
-        msg = load_model()
-        yield msg, None
+    status = state.get('status', 'unknown')
+    current_file = state.get('current_file', '')
+    total_files = state.get('total_files', 0)
+    file_idx = state.get('file_idx', 0)
+    progress_pct = state.get('progress', 0) * 100
+    message = state.get('message', '')
+    generated_files = state.get('generated_files', [])
+    
+    if status == 'running':
+        status_msg = f"🟢 任务运行中\n"
+        if total_files > 0:
+            status_msg += f"进度: {file_idx + 1}/{total_files} 文件 ({progress_pct:.1f}%)\n"
+        if current_file:
+            status_msg += f"当前文件: {current_file}\n"
+        if message:
+            status_msg += f"状态: {message}"
+    elif status == 'completed':
+        status_msg = f"✅ 任务已完成\n"
+        if message:
+            status_msg += f"{message}"
+        if generated_files:
+            status_msg += f"\n已生成 {len(generated_files)} 个文件"
+    elif status == 'stopped':
+        status_msg = f"🛑 任务已停止\n"
+        if message:
+            status_msg += f"{message}"
+    elif status == 'error':
+        status_msg = f"❌ 任务出错\n"
+        if message:
+            status_msg += f"{message}"
+    else:
+        status_msg = f"状态: {status}\n"
+        if message:
+            status_msg += f"{message}"
+    
+    # 如果有生成的文件，返回文件列表
+    files = None
+    if generated_files:
+        # 检查文件是否存在（支持相对路径和绝对路径）
+        existing_files = []
+        for f in generated_files:
+            # 如果是相对路径，尝试在当前目录查找
+            if not os.path.isabs(f):
+                full_path = os.path.join(current_dir, f)
+                if os.path.exists(full_path):
+                    existing_files.append(full_path)
+            elif os.path.exists(f):
+                existing_files.append(f)
+        if existing_files:
+            files = existing_files
+    
+    return status_msg, files
+
+def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
+    """
+    在后台线程中执行转换任务（不依赖 yield，即使前端关闭也能继续运行）
+    """
+    global cosyvoice_model, stop_flag, current_inference_thread
+    
+    current_inference_thread = threading.current_thread()
+    
+    # 初始化任务状态
+    task_state = {
+        'status': 'running',
+        'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'current_file': '',
+        'file_idx': 0,
+        'total_files': 0,
+        'progress': 0.0,
+        'message': '任务启动中...',
+        'generated_files': []
+    }
+    save_task_state(task_state)
+    
+    try:
+        # 1. 检查模型状态
         if cosyvoice_model is None:
+            msg = "Loading model..."
+            task_state['message'] = msg
+            task_state['progress'] = 0.0
+            save_task_state(task_state)
+            msg = load_model()
+            task_state['message'] = msg
+            save_task_state(task_state)
+            if cosyvoice_model is None:
+                task_state['status'] = 'error'
+                task_state['message'] = '模型加载失败'
+                save_task_state(task_state)
+                return
+            if stop_flag.is_set():
+                msg = "转换已停止"
+                task_state['status'] = 'stopped'
+                task_state['message'] = msg
+                save_task_state(task_state)
+                return
+
+        # 2. 验证输入
+        msg = "Validating inputs..."
+        task_state['message'] = msg
+        task_state['progress'] = 0.1
+        save_task_state(task_state)
+        
+        if not text_files:
+            task_state['status'] = 'error'
+            task_state['message'] = "Error: Please upload at least one text file."
+            save_task_state(task_state)
+            return
+        
+        if not ref_audio_name:
+            task_state['status'] = 'error'
+            task_state['message'] = "Error: Please select a reference audio."
+            save_task_state(task_state)
             return
 
-    # 2. 验证输入
-    progress(0.1, desc="Validating inputs...")
-    yield "Validating inputs...", None
-    if not text_files:
-        yield "Error: Please upload at least one text file.", None
-        return
-    
-    if not ref_audio_name:
-        yield "Error: Please select a reference audio.", None
-        return
+        ref_audio_path = os.path.join(ASSETS_DIR, ref_audio_name)
+        if not os.path.exists(ref_audio_path):
+            task_state['status'] = 'error'
+            task_state['message'] = f"Error: Audio file not found: {ref_audio_path}"
+            save_task_state(task_state)
+            return
 
-    ref_audio_path = os.path.join(ASSETS_DIR, ref_audio_name)
-    if not os.path.exists(ref_audio_path):
-        yield f"Error: Audio file not found: {ref_audio_path}", None
-        return
+        # 确保 text_files 是列表
+        if not isinstance(text_files, list):
+            text_files = [text_files]
+        
+        total_files = len(text_files)
+        all_generated_files = []
+        
+        # 更新任务状态
+        task_state['total_files'] = total_files
+        task_state['generated_files'] = []
+        save_task_state(task_state)
 
-    # 确保 text_files 是列表
-    if not isinstance(text_files, list):
-        text_files = [text_files]
-
-    total_files = len(text_files)
-    all_generated_files = []
-    last_mp4_path = None
-
-    try:
         for file_idx, text_file in enumerate(text_files):
+            # 检查停止标志
+            if stop_flag.is_set():
+                msg = "转换已停止"
+                task_state['status'] = 'stopped'
+                task_state['message'] = msg
+                save_task_state(task_state)
+                break
+                
             file_name = os.path.basename(text_file.name)
-            progress((file_idx) / total_files, desc=f"Processing file {file_idx + 1}/{total_files}: {file_name}")
-            yield f"Processing file {file_idx + 1}/{total_files}: {file_name}...", None
+            msg = f"Processing file {file_idx + 1}/{total_files}: {file_name}..."
+            task_state['current_file'] = file_name
+            task_state['file_idx'] = file_idx
+            task_state['message'] = msg
+            task_state['progress'] = file_idx / total_files
+            save_task_state(task_state)
 
             # 读取文本
             with open(text_file.name, 'r', encoding='utf-8') as f:
                 full_text = f.read().strip()
             
-            yield f"File {file_idx + 1}/{total_files}: Text loaded ({len(full_text)} chars). Inferencing...", None
+            msg = f"File {file_idx + 1}/{total_files}: Text loaded ({len(full_text)} chars). Inferencing..."
+            task_state['message'] = msg
+            save_task_state(task_state)
+            
+            if stop_flag.is_set():
+                msg = "转换已停止"
+                task_state['status'] = 'stopped'
+                task_state['message'] = msg
+                save_task_state(task_state)
+                break
             
             from cosyvoice.utils.file_utils import load_wav
             prompt_speech_16k = load_wav(ref_audio_path, 16000)
@@ -140,27 +317,67 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=gr.Progress(t
             
             # 3. 开始推理
             chunk_count = 0
-            # 粗略估算总 chunks 数：假设每 10 个字符生成一个 chunk（根据经验值调整）
             estimated_chunks = max(1, len(full_text) // 10)
             
-            for i, output in enumerate(cosyvoice_model.inference_zero_shot(full_text, prompt_text, prompt_speech_16k, stream=False)):
-                chunk_count += 1
-                duration = output['tts_speech'].shape[1] / 24000
-                msg = f"File {file_idx + 1}/{total_files}: Generated chunk {chunk_count} ({duration:.2f}s)..."
-                yield msg, None
-                
-                # 计算当前文件内的进度 (0.0 - 0.9)，预留 0.1 给视频转换
-                file_progress = min(0.9, chunk_count / estimated_chunks)
-                global_progress = (file_idx + file_progress) / total_files
-                progress(global_progress, desc=msg)
-                
-                all_audio.append(output['tts_speech'])
+            try:
+                for i, output in enumerate(cosyvoice_model.inference_zero_shot(full_text, prompt_text, prompt_speech_16k, stream=False)):
+                    # 检查停止标志
+                    if stop_flag.is_set():
+                        msg = "转换已停止，正在清理资源..."
+                        task_state['message'] = msg
+                        save_task_state(task_state)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        break
+                    
+                    chunk_count += 1
+                    duration = output['tts_speech'].shape[1] / 24000
+                    msg = f"File {file_idx + 1}/{total_files}: Generated chunk {chunk_count} ({duration:.2f}s)..."
+                    
+                    # 计算当前文件内的进度 (0.0 - 0.9)，预留 0.1 给视频转换
+                    file_progress = min(0.9, chunk_count / estimated_chunks)
+                    global_progress = (file_idx + file_progress) / total_files
+                    task_state['message'] = msg
+                    task_state['progress'] = global_progress
+                    save_task_state(task_state)
+                    
+                    all_audio.append(output['tts_speech'])
+            except Exception as e:
+                if stop_flag.is_set():
+                    msg = "转换已停止"
+                    task_state['status'] = 'stopped'
+                    task_state['message'] = msg
+                    save_task_state(task_state)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return
+                raise
+
+            if stop_flag.is_set():
+                msg = "转换已停止"
+                task_state['status'] = 'stopped'
+                task_state['message'] = msg
+                save_task_state(task_state)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return
 
             if not all_audio:
-                yield f"File {file_idx + 1}/{total_files}: Error: No audio generated for {file_name}", None
+                msg = f"File {file_idx + 1}/{total_files}: Error: No audio generated for {file_name}"
+                task_state['message'] = msg
+                save_task_state(task_state)
                 continue
 
             # 4. 处理结果（按最大时长拆分）
+            if stop_flag.is_set():
+                msg = "转换已停止"
+                task_state['status'] = 'stopped'
+                task_state['message'] = msg
+                save_task_state(task_state)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return
+            
             MAX_DURATION_SEC = 45 * 60  # 45 minutes
             
             full_audio_tensor = torch.cat(all_audio, dim=1)
@@ -175,7 +392,16 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=gr.Progress(t
             base_filename = os.path.splitext(file_name)[0]
             
             for i in range(num_parts):
-                progress((file_idx + (i / num_parts)) / total_files, desc=f"Converting part {i+1}/{num_parts} to video...")
+                if stop_flag.is_set():
+                    msg = "转换已停止"
+                    task_state['status'] = 'stopped'
+                    task_state['message'] = msg
+                    save_task_state(task_state)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return
+                
+                part_progress = (file_idx + (i / num_parts)) / total_files
                 
                 start = i * max_samples
                 end = min((i + 1) * max_samples, total_samples)
@@ -186,12 +412,16 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=gr.Progress(t
                 
                 temp_wav = os.path.join(current_dir, f"temp_{output_base}.wav")
                 output_mp4 = f"{output_base}.mp4"
-                mp4_path = os.path.join(current_dir, output_mp4)
+                mp4_path = os.path.join(OUTPUT_DIR, output_mp4)
                 
                 torchaudio.save(temp_wav, part_tensor, sample_rate)
                 
                 # 5. 生成视频 (FFmpeg)
-                yield f"File {file_idx + 1}/{total_files}: Converting part {i+1}/{num_parts} to video...", None
+                msg = f"File {file_idx + 1}/{total_files}: Converting part {i+1}/{num_parts} to video..."
+                part_progress = (file_idx + (i / num_parts)) / total_files
+                task_state['message'] = msg
+                task_state['progress'] = part_progress
+                save_task_state(task_state)
                 
                 cmd = [
                     "ffmpeg", "-y",
@@ -209,60 +439,510 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=gr.Progress(t
                     os.remove(temp_wav)
 
                 if process.returncode != 0:
-                     print(f"FFmpeg error part {i+1}: {process.stderr.decode()}")
-                     yield f"File {file_idx + 1}/{total_files}: Video generation failed for part {i+1}.", None
+                     error_msg = f"FFmpeg error part {i+1}: {process.stderr.decode()}"
+                     print(error_msg)
+                     msg = f"File {file_idx + 1}/{total_files}: Video generation failed for part {i+1}."
+                     task_state['message'] = msg
+                     save_task_state(task_state)
                 else:
-                    all_generated_files.append(output_mp4)
+                    # 保存完整路径到输出文件夹
+                    all_generated_files.append(mp4_path)
+                    task_state['generated_files'] = all_generated_files.copy()
+                    save_task_state(task_state)
             
             file_time = time.time() - start_time
-            yield f"File {file_idx + 1}/{total_files}: Done ({file_time:.2f}s)", all_generated_files
+            msg = f"File {file_idx + 1}/{total_files}: Done ({file_time:.2f}s)"
+            task_state['message'] = msg
+            task_state['progress'] = (file_idx + 1) / total_files
+            task_state['generated_files'] = all_generated_files.copy()
+            save_task_state(task_state)
 
-        progress(1.0, desc="All done!")
-        msg = f"All done! Generated {len(all_generated_files)} file(s):\n" + "\n".join(all_generated_files)
-        yield msg, all_generated_files
+        if stop_flag.is_set():
+            msg = "转换已停止"
+            task_state['status'] = 'stopped'
+            task_state['message'] = msg
+            save_task_state(task_state)
+        else:
+            # 显示文件名（不包含完整路径）
+            file_names = [os.path.basename(f) for f in all_generated_files]
+            msg = f"All done! Generated {len(all_generated_files)} file(s) in output folder:\n" + "\n".join(file_names)
+            task_state['status'] = 'completed'
+            task_state['message'] = msg
+            task_state['progress'] = 1.0
+            task_state['generated_files'] = all_generated_files
+            save_task_state(task_state)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        yield f"Error: {str(e)}", None
+        if stop_flag.is_set():
+            msg = "转换已停止"
+            task_state['status'] = 'stopped'
+            task_state['message'] = msg
+            save_task_state(task_state)
+        else:
+            import traceback
+            error_trace = traceback.format_exc()
+            print(error_trace)
+            task_state['status'] = 'error'
+            task_state['message'] = f"Error: {str(e)}"
+            save_task_state(task_state)
+    finally:
+        # 清理资源
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        current_inference_thread = None
+
+def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
+    """
+    启动转换任务（在后台线程中执行，即使前端关闭也能继续运行）
+    这个函数只负责启动任务并定期报告状态
+    """
+    global background_task_thread, stop_flag
+    
+    # 如果已有任务在运行，先停止它
+    if background_task_thread and background_task_thread.is_alive():
+        stop_flag.set()
+        background_task_thread.join(timeout=2)
+        # Bug 2 Fix: 如果线程仍在运行，保持停止标志设置，不重置
+        # 只有在线程确实已结束时才清除标志
+        if background_task_thread.is_alive():
+            # 线程仍在运行，保持停止标志设置
+            # 新任务不应该启动，因为旧任务还在运行
+            yield "Error: Previous task is still running. Please wait for it to stop or restart the application.", None
+            return
+        # 线程已结束，现在可以安全地清除标志
+        stop_flag.clear()
+    else:
+        # 没有运行中的任务，确保标志已清除
+        stop_flag.clear()
+    
+    # 验证输入
+    if not text_files:
+        yield "Error: Please upload at least one text file.", None
+        return
+    
+    if not ref_audio_name:
+        yield "Error: Please select a reference audio.", None
+        return
+
+    ref_audio_path = os.path.join(ASSETS_DIR, ref_audio_name)
+    if not os.path.exists(ref_audio_path):
+        yield f"Error: Audio file not found: {ref_audio_path}", None
+        return
+    
+    # 保存文件路径（因为 text_file.name 可能在后台线程中失效）
+    if not isinstance(text_files, list):
+        text_files = [text_files]
+    
+    # 保存文件路径到临时文件，供后台线程使用
+    text_file_paths = []
+    for text_file in text_files:
+        # 如果是文件对象，保存路径
+        if hasattr(text_file, 'name'):
+            text_file_paths.append(text_file.name)
+        else:
+            text_file_paths.append(str(text_file))
+    
+    # 启动后台任务线程
+    def run_task():
+        # 重新打开文件（因为原始文件对象可能已关闭）
+        file_objects = []
+        for path in text_file_paths:
+            if os.path.exists(path):
+                # 创建一个类似文件对象的包装
+                class FileWrapper:
+                    def __init__(self, path):
+                        self.name = path
+                file_objects.append(FileWrapper(path))
+        
+        if file_objects:
+            _execute_conversion_task(file_objects, ref_audio_name, prompt_text)
+        else:
+            # Bug 1 Fix: 如果没有找到任何文件，更新任务状态为错误
+            task_state = {
+                'status': 'error',
+                'message': 'Error: No valid text files found. Files may have been deleted or moved.',
+                'progress': 0.0,
+                'generated_files': []
+            }
+            save_task_state(task_state)
+    
+    background_task_thread = threading.Thread(target=run_task, daemon=False)
+    background_task_thread.start()
+    
+    # 初始化任务状态
+    task_state = {
+        'status': 'running',
+        'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'current_file': '',
+        'file_idx': 0,
+        'total_files': 0,
+        'progress': 0.0,
+        'message': '任务启动中...',
+        'generated_files': []
+    }
+    save_task_state(task_state)
+    
+    yield "任务已启动，正在后台运行...", None
+    
+    # 定期报告任务状态（即使前端关闭，任务也会在后台继续运行）
+    last_status = None
+    last_files = None
+    while True:
+        try:
+            # 检查任务是否还在运行
+            if background_task_thread and not background_task_thread.is_alive():
+                # 任务已完成，获取最终状态
+                status_msg, files = get_task_status()
+                if status_msg != last_status or files != last_files:
+                    yield status_msg, files
+                break
+            
+            # 获取当前任务状态
+            status_msg, files = get_task_status()
+            if status_msg != last_status or files != last_files:
+                yield status_msg, files
+                last_status = status_msg
+                last_files = files
+            
+            # 检查任务是否完成或出错
+            task_state = load_task_state()
+            if task_state and task_state.get('status') in ['completed', 'error', 'stopped']:
+                # 任务已完成，等待线程结束
+                if background_task_thread:
+                    background_task_thread.join(timeout=1)
+                # 获取最终状态
+                status_msg, files = get_task_status()
+                yield status_msg, files
+                break
+            
+            # 等待一段时间再检查（避免过于频繁）
+            time.sleep(1)
+            
+        except GeneratorExit:
+            # 前端关闭，但任务继续在后台运行
+            # 不重新抛出异常，让生成器正常结束
+            break
+        except Exception as e:
+            # 其他异常，记录但不中断任务
+            print(f"Error in status reporting: {e}")
+            time.sleep(1)
 
 def refresh_audio_list():
     return gr.Dropdown(choices=get_reference_audio_list())
 
-# Gradio 界面构建
-with gr.Blocks(title="CosyVoice Book Converter") as demo:
-    gr.Markdown("# 📚 CosyVoice 有声书转换器")
-    gr.Markdown("上传 txt 文本，选择预设的参考音频，一键生成有声书视频。")
+def _cleanup_model_background():
+    """在后台线程中清理模型资源（避免阻塞主线程）"""
+    global cosyvoice_model
+    import gc
+    import time
     
-    with gr.Row():
-        with gr.Column():
-            text_input = gr.File(label="上传书籍 (.txt)", file_types=[".txt"], file_count="multiple")
+    try:
+        # 先等待一小段时间，确保主函数已经返回
+        time.sleep(0.2)
+        
+        # 安全地检查模型是否存在
+        model_ref = None
+        try:
+            model_ref = cosyvoice_model
+        except Exception:
+            pass
+        
+        if model_ref is not None:
+            try:
+                # 尝试将模型移到 CPU（如果支持）
+                if hasattr(model_ref, 'to'):
+                    try:
+                        model_ref.to('cpu')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             
-            with gr.Group():
-                gr.Markdown("### 参考音频设置")
+            # 删除模型引用
+            try:
+                del model_ref
+            except Exception:
+                pass
+            
+            # 清除全局引用
+            try:
+                cosyvoice_model = None
+            except Exception:
+                pass
+            print("模型已卸载")
+        
+        # 清理 CUDA 缓存（使用 try-except 包裹，避免阻塞）
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        
+        # 垃圾回收
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        
+        # 再次清理 CUDA
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"后台清理模型时出现警告: {e}")
+        try:
+            cosyvoice_model = None
+        except Exception:
+            pass
+
+def stop_conversion():
+    """停止转换并强制清理资源，包括卸载模型 - 快速返回版本"""
+    global stop_flag
+    
+    # 第一步：立即设置停止标志（最快操作）
+    try:
+        stop_flag.set()
+    except Exception:
+        pass
+    
+    # 第二步：立即返回消息（不等待任何其他操作）
+    result_msg = "🛑 转换已停止，正在清理资源..."
+    
+    # 第三步：所有其他操作都在后台异步执行
+    def async_operations():
+        """异步执行所有可能阻塞的操作"""
+        global cosyvoice_model
+        try:
+            # 等待确保主函数已返回
+            import time
+            time.sleep(0.1)
+            
+            # 更新任务状态
+            try:
+                task_state = load_task_state()
+                task_state['status'] = 'stopped'
+                task_state['message'] = result_msg
+                save_task_state(task_state)
+            except Exception:
+                pass
+            
+            # 执行模型清理
+            _cleanup_model_background()
+        except Exception as e:
+            print(f"后台操作时出现警告: {e}")
+    
+    # 启动后台线程（不等待）
+    try:
+        threading.Thread(target=async_operations, daemon=True).start()
+    except Exception:
+        pass
+    
+    # 立即返回，不等待任何操作
+    return result_msg
+
+# Gradio 界面构建
+custom_css = """
+    /* 主容器自适应 */
+    .gradio-container {
+        max-width: 100% !important;
+        width: 100% !important;
+        height: 100vh !important;
+        max-height: 100vh !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+    }
+    
+    .main-container {
+        padding: 0.3rem !important;
+        flex: 1 1 auto !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        min-height: 0 !important;
+        max-height: 100% !important;
+    }
+    
+    /* 标题自适应 */
+    .markdown {
+        margin: 0.2rem 0 !important;
+        font-size: clamp(0.9rem, 2vw, 1.1rem) !important;
+        flex-shrink: 0 !important;
+    }
+    
+    /* 表单元素自适应 */
+    .form {
+        margin-bottom: 0.3rem !important;
+        flex-shrink: 0 !important;
+    }
+    
+    .panel {
+        margin-bottom: 0.3rem !important;
+        flex-shrink: 0 !important;
+    }
+    
+    /* 文件上传区域自适应 */
+    .file-upload-area {
+        min-height: 60px !important;
+        height: auto !important;
+        max-height: 150px !important;
+        overflow-y: auto !important;
+    }
+    
+    /* 文本框自适应 */
+    .textbox {
+        min-height: auto !important;
+        height: auto !important;
+        resize: vertical !important;
+    }
+    
+    /* 按钮自适应 */
+    .button {
+        height: auto !important;
+        min-height: 32px !important;
+        padding: 0.3rem 0.8rem !important;
+        white-space: nowrap !important;
+    }
+    
+    .accordion {
+        margin-bottom: 0.3rem !important;
+        flex-shrink: 0 !important;
+    }
+    
+    /* 行布局自适应 */
+    .gradio-row {
+        flex-wrap: wrap !important;
+        gap: 0.5rem !important;
+        align-items: flex-start !important;
+    }
+    
+    /* 列布局自适应 */
+    .gradio-column {
+        display: flex !important;
+        flex-direction: column !important;
+        min-height: fit-content !important;
+        height: auto !important;
+        flex: 1 1 auto !important;
+    }
+    
+    /* 输出文本框自适应 */
+    .output-textbox {
+        flex: 1 1 auto !important;
+        min-height: 100px !important;
+        max-height: 40vh !important;
+        overflow-y: auto !important;
+        resize: vertical !important;
+    }
+    
+    /* 文件下载区域自适应 */
+    .file-download {
+        flex-shrink: 0 !important;
+        max-height: 25vh !important;
+        overflow-y: auto !important;
+        min-height: 60px !important;
+    }
+    
+    /* 响应式布局：小屏幕时上下堆叠 */
+    @media (max-width: 768px) {
+        .gradio-row {
+            flex-direction: column !important;
+        }
+        
+        .gradio-column {
+            width: 100% !important;
+            min-width: 100% !important;
+            max-width: 100% !important;
+        }
+        
+        .output-textbox {
+            max-height: 30vh !important;
+        }
+        
+        .file-download {
+            max-height: 20vh !important;
+        }
+    }
+    
+    /* 超小屏幕优化 */
+    @media (max-width: 480px) {
+        .main-container {
+            padding: 0.2rem !important;
+        }
+        
+        .button {
+            min-height: 36px !important;
+            font-size: 0.9rem !important;
+        }
+        
+        .output-textbox {
+            max-height: 25vh !important;
+        }
+    }
+    
+    /* 高屏幕优化 */
+    @media (min-height: 900px) {
+        .output-textbox {
+            max-height: 50vh !important;
+        }
+    }
+"""
+
+with gr.Blocks(title="CosyVoice Book Converter", theme=gr.themes.Soft(), css=custom_css) as demo:
+    gr.Markdown("### 📚 CosyVoice 有声书转换器")
+    
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=1, min_width=280):
+            text_input = gr.File(
+                label="上传书籍 (.txt)", 
+                file_types=[".txt"], 
+                file_count="multiple"
+            )
+            
+            with gr.Accordion("参考音频设置", open=False):
                 with gr.Row():
                     ref_audio_dropdown = gr.Dropdown(
-                        label="选择参考音频 (来自 assets 文件夹)", 
+                        label="参考音频", 
                         choices=get_reference_audio_list(),
                         value=get_reference_audio_list()[0] if get_reference_audio_list() else None,
-                        interactive=True
+                        interactive=True,
+                        scale=4,
+                        container=False
                     )
-                    refresh_btn = gr.Button("🔄", size="sm", scale=0)
+                    refresh_btn = gr.Button("🔄", size="sm", scale=1, min_width=40)
                 
                 prompt_text_input = gr.Textbox(
-                    label="参考音频对应的文本 (Prompt Text)", 
-                    lines=2,
-                    placeholder="选择音频后自动填充..."
+                    label="Prompt Text", 
+                    lines=1,
+                    placeholder="选择音频后自动填充...",
+                    max_lines=1,
+                    container=False
                 )
             
             with gr.Row():
-                convert_btn = gr.Button("开始转换", variant="primary")
-                stop_btn = gr.Button("停止转换", variant="stop")
+                convert_btn = gr.Button("开始转换", variant="primary", scale=1, size="sm")
+                stop_btn = gr.Button("停止转换", variant="stop", scale=1, size="sm")
         
-        with gr.Column():
-            log_output = gr.Textbox(label="运行日志", lines=10, interactive=False)
-            # video_output removed
-            files_output = gr.File(label="所有生成文件下载", file_count="multiple", interactive=False)
+        with gr.Column(scale=1, min_width=280):
+            with gr.Row():
+                log_output = gr.Textbox(
+                    label="运行日志", 
+                    lines=6, 
+                    interactive=False,
+                    show_copy_button=True,
+                    container=False,
+                    elem_classes=["output-textbox"],
+                    scale=4
+                )
+                refresh_log_btn = gr.Button("🔄 刷新日志", size="sm", scale=1, min_width=80)
+            files_output = gr.File(
+                label="生成文件下载", 
+                file_count="multiple", 
+                interactive=False,
+                elem_classes=["file-download"]
+            )
 
     # 事件绑定
     refresh_btn.click(fn=refresh_audio_list, inputs=[], outputs=ref_audio_dropdown)
@@ -280,14 +960,50 @@ with gr.Blocks(title="CosyVoice Book Converter") as demo:
         outputs=[log_output, files_output]
     )
     
-    stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[submit_event])
-    
-    # 初始化时尝试加载第一个音频的文本
-    demo.load(
-        fn=get_prompt_text_for_audio,
-        inputs=[ref_audio_dropdown], 
-        outputs=[prompt_text_input]
+    # 停止按钮：调用停止函数并取消事件
+    # 使用 show_progress=False 和 queue=False 确保立即响应
+    stop_btn.click(
+        fn=stop_conversion,
+        inputs=None,
+        outputs=[log_output],
+        cancels=[submit_event],
+        show_progress=False
     )
+    
+    # 刷新日志按钮 - 同时刷新任务状态
+    refresh_log_btn.click(
+        fn=get_task_status,
+        inputs=None,
+        outputs=[log_output, files_output]
+    )
+    
+    # 初始化时尝试加载第一个音频的文本，并恢复任务状态
+    def init_ui(ref_audio):
+        """初始化界面：加载音频文本和恢复任务状态"""
+        prompt_text = get_prompt_text_for_audio(ref_audio)
+        status_msg, files = get_task_status()
+        return prompt_text, status_msg, files
+    
+    demo.load(
+        fn=init_ui,
+        inputs=[ref_audio_dropdown], 
+        outputs=[prompt_text_input, log_output, files_output]
+    )
+    
+    # 注意：自动刷新功能需要 Gradio 4.0+，如果版本不支持会报错
+    # 已提供手动刷新按钮，用户可以通过点击"🔄 刷新日志"按钮来查看最新状态
+    # 如果需要自动刷新，请升级 Gradio: pip install --upgrade gradio>=4.0.0
+    try:
+        demo.load(
+            fn=get_task_status,
+            inputs=None,
+            outputs=[log_output, files_output],
+            every=5  # 每5秒自动刷新（需要 Gradio 4.0+）
+        )
+    except TypeError:
+        # Gradio 版本不支持 every 参数，跳过自动刷新
+        # 用户可以使用手动刷新按钮
+        pass
 
 if __name__ == "__main__":
     print("Starting Web UI...")
@@ -296,14 +1012,23 @@ if __name__ == "__main__":
     # 尝试禁用 localhost 检查
     gradio.strings.en["SHARE_LINK_MESSAGE"] = ""
     try:
-        demo.queue().launch(
+        # 使用 queue() 启用任务队列，确保任务在后台继续运行
+        # max_size=1 确保只有一个任务在运行
+        # Gradio 的 queue() 默认支持后台任务，即使前端关闭也不会中断
+        demo.queue(max_size=1, default_concurrency_limit=1).launch(
             server_name="0.0.0.0", 
             server_port=7860, 
             show_error=True,
             quiet=False,
-            _frontend=False  # 禁用前端检查
+            inbrowser=False
         )
     except ValueError as e:
         if "shareable link" in str(e):
             print("Fallback: Using share=True due to network restrictions")
-            demo.queue().launch(server_name="0.0.0.0", server_port=7860, show_error=True, share=True)
+            demo.queue(max_size=1, default_concurrency_limit=1).launch(
+                server_name="0.0.0.0", 
+                server_port=7860, 
+                show_error=True, 
+                share=True,
+                inbrowser=False
+            )

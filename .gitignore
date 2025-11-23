@@ -1,2 +1,10 @@
 Data/
 
+# 生成的文件输出目录
+output/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+

@@ -1,0 +1,29 @@
+{
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*"
+  ],
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": false,
+  "venvPath": "/home/boom/miniconda3/envs",
+  "venv": "cosyvoice",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "pythonVersion": "3.10",
+      "pythonPlatform": "Linux",
+      "extraPaths": [
+        "CosyVoice",
+        "CosyVoice/third_party/Matcha-TTS"
+      ]
+    }
+  ]
+}
+
