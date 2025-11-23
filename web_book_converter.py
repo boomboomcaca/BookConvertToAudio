@@ -722,9 +722,10 @@ def stop_conversion():
             # 更新任务状态
             try:
                 task_state = load_task_state()
-                task_state['status'] = 'stopped'
-                task_state['message'] = result_msg
-                save_task_state(task_state)
+                if task_state is not None:
+                    task_state['status'] = 'stopped'
+                    task_state['message'] = result_msg
+                    save_task_state(task_state)
             except Exception:
                 pass
             
