@@ -238,6 +238,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 task_state['status'] = 'stopped'
                 task_state['message'] = msg
                 save_task_state(task_state)
+                print("模型加载后检测到停止标志，开始清理模型...")
+                _cleanup_model_immediate()
                 return
 
         # 2. 验证输入
@@ -284,6 +286,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 task_state['status'] = 'stopped'
                 task_state['message'] = msg
                 save_task_state(task_state)
+                print("文件循环中检测到停止标志，开始清理模型...")
+                _cleanup_model_immediate()
                 break
                 
             file_name = os.path.basename(text_file.name)
@@ -307,6 +311,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 task_state['status'] = 'stopped'
                 task_state['message'] = msg
                 save_task_state(task_state)
+                print("推理开始前检测到停止标志，开始清理模型...")
+                _cleanup_model_immediate()
                 break
             
             from cosyvoice.utils.file_utils import load_wav
@@ -326,8 +332,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                         msg = "转换已停止，正在清理资源..."
                         task_state['message'] = msg
                         save_task_state(task_state)
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        print("推理过程中检测到停止标志，开始清理模型...")
+                        _cleanup_model_immediate()
                         break
                     
                     chunk_count += 1
@@ -348,8 +354,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                     task_state['status'] = 'stopped'
                     task_state['message'] = msg
                     save_task_state(task_state)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    print("推理异常时检测到停止标志，开始清理模型...")
+                    _cleanup_model_immediate()
                     return
                 raise
 
@@ -358,8 +364,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 task_state['status'] = 'stopped'
                 task_state['message'] = msg
                 save_task_state(task_state)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                print("推理完成后检测到停止标志，开始清理模型...")
+                _cleanup_model_immediate()
                 return
 
             if not all_audio:
@@ -374,8 +380,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 task_state['status'] = 'stopped'
                 task_state['message'] = msg
                 save_task_state(task_state)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                print("处理结果前检测到停止标志，开始清理模型...")
+                _cleanup_model_immediate()
                 return
             
             MAX_DURATION_SEC = 45 * 60  # 45 minutes
@@ -397,8 +403,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                     task_state['status'] = 'stopped'
                     task_state['message'] = msg
                     save_task_state(task_state)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    print("处理文件分片时检测到停止标志，开始清理模型...")
+                    _cleanup_model_immediate()
                     return
                 
                 part_progress = (file_idx + (i / num_parts)) / total_files
@@ -462,6 +468,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             task_state['status'] = 'stopped'
             task_state['message'] = msg
             save_task_state(task_state)
+            # 注意：模型清理在 finally 块中统一处理
         else:
             # 显示文件名（不包含完整路径）
             file_names = [os.path.basename(f) for f in all_generated_files]
@@ -478,6 +485,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             task_state['status'] = 'stopped'
             task_state['message'] = msg
             save_task_state(task_state)
+            # 注意：模型清理在 finally 块中统一处理
         else:
             import traceback
             error_trace = traceback.format_exc()
@@ -486,9 +494,14 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             task_state['message'] = f"Error: {str(e)}"
             save_task_state(task_state)
     finally:
-        # 清理资源
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 清理资源（如果停止标志被设置，立即清理模型）
+        if stop_flag.is_set():
+            print("检测到停止标志，正在清理模型资源...")
+            _cleanup_model_immediate()
+        else:
+            # 正常完成时只清理CUDA缓存，保留模型以便下次使用
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         current_inference_thread = None
 
 def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
@@ -630,16 +643,12 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
 def refresh_audio_list():
     return gr.Dropdown(choices=get_reference_audio_list())
 
-def _cleanup_model_background():
-    """在后台线程中清理模型资源（避免阻塞主线程）"""
+def _cleanup_model_immediate():
+    """立即清理模型资源（同步执行，确保GPU资源释放）"""
     global cosyvoice_model
     import gc
-    import time
     
     try:
-        # 先等待一小段时间，确保主函数已经返回
-        time.sleep(0.2)
-        
         # 安全地检查模型是否存在
         model_ref = None
         try:
@@ -653,8 +662,16 @@ def _cleanup_model_background():
                 if hasattr(model_ref, 'to'):
                     try:
                         model_ref.to('cpu')
-                    except Exception:
-                        pass
+                        print("模型已移到CPU")
+                    except Exception as e:
+                        print(f"移动模型到CPU时出现警告: {e}")
+            except Exception as e:
+                print(f"检查模型移动方法时出现警告: {e}")
+            
+            # 尝试清理模型内部资源
+            try:
+                if hasattr(model_ref, 'cpu'):
+                    model_ref.cpu()
             except Exception:
                 pass
             
@@ -669,79 +686,119 @@ def _cleanup_model_background():
                 cosyvoice_model = None
             except Exception:
                 pass
-            print("模型已卸载")
+            print("模型引用已清除")
         
-        # 清理 CUDA 缓存（使用 try-except 包裹，避免阻塞）
+        # 清理 CUDA 缓存
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        except Exception:
-            pass
+                torch.cuda.synchronize()  # 确保所有CUDA操作完成
+                print("CUDA缓存已清理")
+        except Exception as e:
+            print(f"清理CUDA缓存时出现警告: {e}")
         
         # 垃圾回收
         try:
             gc.collect()
-        except Exception:
-            pass
+            print("垃圾回收已完成")
+        except Exception as e:
+            print(f"垃圾回收时出现警告: {e}")
         
-        # 再次清理 CUDA
+        # 再次清理 CUDA（确保彻底释放）
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
             pass
     except Exception as e:
-        print(f"后台清理模型时出现警告: {e}")
+        print(f"清理模型时出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+        # 即使出错也尝试清除全局引用
         try:
             cosyvoice_model = None
         except Exception:
             pass
 
+def _cleanup_model_background():
+    """在后台线程中清理模型资源（避免阻塞主线程）"""
+    import time
+    # 先等待一小段时间，确保主函数已经返回
+    time.sleep(0.2)
+    # 调用立即清理函数
+    _cleanup_model_immediate()
+
 def stop_conversion():
     """停止转换并强制清理资源，包括卸载模型 - 快速返回版本"""
     global stop_flag
     
-    # 第一步：立即设置停止标志（最快操作）
+    # 用 try-except 包裹整个函数，捕获所有未处理的异常
     try:
-        stop_flag.set()
-    except Exception:
-        pass
-    
-    # 第二步：立即返回消息（不等待任何其他操作）
-    result_msg = "🛑 转换已停止，正在清理资源..."
-    
-    # 第三步：所有其他操作都在后台异步执行
-    def async_operations():
-        """异步执行所有可能阻塞的操作"""
-        global cosyvoice_model
+        # 第一步：立即设置停止标志（最快操作）
         try:
-            # 等待确保主函数已返回
-            import time
-            time.sleep(0.1)
-            
-            # 更新任务状态
-            try:
-                task_state = load_task_state()
-                if task_state is not None:
-                    task_state['status'] = 'stopped'
-                    task_state['message'] = result_msg
-                    save_task_state(task_state)
-            except Exception:
-                pass
-            
-            # 执行模型清理
-            _cleanup_model_background()
+            if stop_flag is not None:
+                stop_flag.set()
         except Exception as e:
-            print(f"后台操作时出现警告: {e}")
+            print(f"ERROR in stop_conversion (stop_flag.set): {e}")
+            # Don't re-raise - continue execution to return message
     
-    # 启动后台线程（不等待）
-    try:
-        threading.Thread(target=async_operations, daemon=True).start()
-    except Exception:
-        pass
+        # 第二步：立即返回消息（不等待任何其他操作）
+        result_msg = "🛑 转换已停止，正在清理资源..."
+        
+        # 第三步：所有其他操作都在后台异步执行
+        def async_operations():
+            """异步执行所有可能阻塞的操作"""
+            global cosyvoice_model
+            try:
+                # 更新任务状态
+                try:
+                    task_state = load_task_state()
+                    if task_state is not None and isinstance(task_state, dict):
+                        task_state['status'] = 'stopped'
+                        task_state['message'] = result_msg
+                        save_task_state(task_state)
+                except Exception as e:
+                    print(f"ERROR in async_operations (task_state): {e}")
+                    pass
+                
+                # 执行模型清理（立即清理，不等待）
+                # 注意：转换任务也会在检测到 stop_flag 时清理模型，这里是双重保险
+                print("stop_conversion: 开始后台清理模型...")
+                _cleanup_model_immediate()
+            except Exception as e:
+                print(f"后台操作时出现警告: {e}")
+        
+        # 启动后台线程（不等待）
+        try:
+            thread = threading.Thread(target=async_operations, daemon=True)
+            thread.start()
+        except Exception as e:
+            print(f"ERROR in stop_conversion (thread start): {e}")
+            pass
+        
+        # 立即返回空列表（不返回消息，因为 outputs=[]，消息通过 task_state 更新显示）
+        return []
     
-    # 立即返回，不等待任何操作
-    return result_msg
+    except Exception as e:
+        # 捕获所有未处理的异常
+        # #region agent log
+        try:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"id":"log_stop_013","timestamp":int(time.time()*1000),"location":"web_book_converter.py:805","message":"stop_conversion unhandled exception","data":{"error":str(e),"traceback":traceback.format_exc()},"sessionId":"debug-session","runId":"run2","hypothesisId":"A"})+'\n')
+        except Exception as log_err:
+            print(f"DEBUG LOG ERROR (unhandled exception): {log_err}")
+        # #endregion
+        print(f"CRITICAL ERROR in stop_conversion: {e}")
+        traceback.print_exc()
+        # 返回空列表（与 outputs=[] 配置一致，避免 Gradio 连接错误）
+        # #region agent log
+        try:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"id":"log_stop_013b","timestamp":int(time.time()*1000),"location":"web_book_converter.py:868","message":"returning empty list from exception handler","data":{"error":str(e)},"sessionId":"debug-session","runId":"run5","hypothesisId":"G,B"})+'\n')
+        except Exception as log_err:
+            print(f"DEBUG LOG ERROR (exception return): {log_err}")
+        # #endregion
+        return []  # 假设G: 返回空列表与 outputs=[] 一致
 
 # Gradio 界面构建
 custom_css = """
@@ -962,12 +1019,27 @@ with gr.Blocks(title="CosyVoice Book Converter", theme=gr.themes.Soft(), css=cus
     )
     
     # 停止按钮：调用停止函数并取消事件
-    # 使用 show_progress=False 和 queue=False 确保立即响应
+    # 使用 show_progress=False 确保立即响应
+    # 不输出到 log_output 以避免与 convert_book 的并发更新冲突
+    # 停止消息会通过任务状态更新，由 get_task_status 自动显示
+    # 
+    # 修复：创建包装函数以确保 Gradio 正确处理返回值
+    def stop_conversion_wrapper():
+        """包装函数：确保 Gradio 正确处理停止操作"""
+        try:
+            stop_conversion()
+            return []  # outputs=[] 时应该返回空列表
+        except Exception as e:
+            print(f"ERROR in stop_conversion_wrapper: {e}")
+            import traceback
+            traceback.print_exc()
+            return []  # 即使异常也返回空列表（与 outputs=[] 一致）
+    
+    # 修复：使用 inputs=[] 和 outputs=[] 而不是 None，确保 Gradio 正确处理返回值
     stop_btn.click(
-        fn=stop_conversion,
-        inputs=None,
-        outputs=[log_output],
-        cancels=[submit_event],
+        fn=stop_conversion_wrapper,
+        inputs=[],
+        outputs=[],
         show_progress=False
     )
     
