@@ -1,0 +1,23 @@
+[Unit]
+Description=Book Convert To Audio Service
+After=network.target
+
+[Service]
+Type=simple
+User=boom
+Group=boom
+WorkingDirectory=/mnt/d/Soft/BookConvertToAudio
+Environment="PATH=/home/boom/miniconda3/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/bin/bash /mnt/d/Soft/BookConvertToAudio/start.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 可选：设置资源限制
+# LimitNOFILE=65536
+# LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
+

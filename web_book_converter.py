@@ -32,6 +32,8 @@ stop_flag = threading.Event()
 current_inference_thread = None
 # 后台任务线程
 background_task_thread = None
+# 任务管理锁：防止并发请求导致 background_task_thread 被覆盖
+background_task_lock = threading.Lock()
 
 # 资源目录
 ASSETS_DIR = os.path.join(current_dir, 'assets')
@@ -502,31 +504,38 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             # 正常完成时只清理CUDA缓存，保留模型以便下次使用
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        current_inference_thread = None
+        # Bug 1 Fix: 只有在当前线程仍然是活动线程时才重置引用
+        # 这防止了竞态条件：如果新任务已经启动并设置了 current_inference_thread，
+        # 旧任务的 finally 块不应该覆盖它
+        if current_inference_thread is threading.current_thread():
+            current_inference_thread = None
 
 def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
     """
     启动转换任务（在后台线程中执行，即使前端关闭也能继续运行）
     这个函数只负责启动任务并定期报告状态
     """
-    global background_task_thread, stop_flag
+    global background_task_thread, stop_flag, background_task_lock
     
-    # 如果已有任务在运行，先停止它
-    if background_task_thread and background_task_thread.is_alive():
-        stop_flag.set()
-        background_task_thread.join(timeout=2)
-        # Bug 2 Fix: 如果线程仍在运行，保持停止标志设置，不重置
-        # 只有在线程确实已结束时才清除标志
-        if background_task_thread.is_alive():
-            # 线程仍在运行，保持停止标志设置
-            # 新任务不应该启动，因为旧任务还在运行
-            yield "Error: Previous task is still running. Please wait for it to stop or restart the application.", None
-            return
-        # 线程已结束，现在可以安全地清除标志
-        stop_flag.clear()
-    else:
-        # 没有运行中的任务，确保标志已清除
-        stop_flag.clear()
+    # Bug 1 Fix: 使用锁同步访问 background_task_thread，防止并发请求导致线程引用被覆盖
+    # 这确保即使 default_concurrency_limit=2 允许并发请求，也只有一个任务能启动
+    with background_task_lock:
+        # 如果已有任务在运行，先停止它
+        if background_task_thread and background_task_thread.is_alive():
+            stop_flag.set()
+            background_task_thread.join(timeout=2)
+            # Bug 2 Fix: 如果线程仍在运行，保持停止标志设置，不重置
+            # 只有在线程确实已结束时才清除标志
+            if background_task_thread.is_alive():
+                # 线程仍在运行，保持停止标志设置
+                # 新任务不应该启动，因为旧任务还在运行
+                yield "Error: Previous task is still running. Please wait for it to stop or restart the application.", None
+                return
+            # 线程已结束，现在可以安全地清除标志
+            stop_flag.clear()
+        else:
+            # 没有运行中的任务，确保标志已清除
+            stop_flag.clear()
     
     # 验证输入
     if not text_files:
@@ -579,8 +588,19 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
             }
             save_task_state(task_state)
     
-    background_task_thread = threading.Thread(target=run_task, daemon=False)
-    background_task_thread.start()
+    # Bug 1 Fix: 在线程创建、赋值和启动时持有锁，防止并发请求覆盖 background_task_thread
+    # 这确保即使两个请求同时到达，也只有一个能成功创建和启动任务线程
+    with background_task_lock:
+        # 再次检查（在锁内），防止在验证输入期间另一个请求已经启动了任务
+        if background_task_thread and background_task_thread.is_alive():
+            yield "Error: Another task was started while validating inputs. Please wait for it to complete.", None
+            return
+        
+        # 创建并赋值线程（在锁保护下）
+        background_task_thread = threading.Thread(target=run_task, daemon=False)
+        # Bug 1 Fix: start() 必须在锁内调用，防止在释放锁和启动线程之间
+        # 另一个请求覆盖 background_task_thread，导致启动错误的线程
+        background_task_thread.start()
     
     # 初始化任务状态
     task_state = {
@@ -598,6 +618,8 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
     yield "任务已启动，正在后台运行...", None
     
     # 定期报告任务状态（即使前端关闭，任务也会在后台继续运行）
+    # 这个循环作为 fallback，确保在 auto-refresh 不可用时（如旧版 Gradio）仍能提供更新
+    # 即使 auto-refresh 可用，这个循环也能提供更及时的更新
     last_status = None
     last_files = None
     while True:
@@ -625,7 +647,8 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
                     background_task_thread.join(timeout=1)
                 # 获取最终状态
                 status_msg, files = get_task_status()
-                yield status_msg, files
+                if status_msg != last_status or files != last_files:
+                    yield status_msg, files
                 break
             
             # 等待一段时间再检查（避免过于频繁）
@@ -741,7 +764,7 @@ def stop_conversion():
         except Exception as e:
             print(f"ERROR in stop_conversion (stop_flag.set): {e}")
             # Don't re-raise - continue execution to return message
-    
+        
         # 第二步：立即返回消息（不等待任何其他操作）
         result_msg = "🛑 转换已停止，正在清理资源..."
         
@@ -1088,7 +1111,9 @@ if __name__ == "__main__":
         # 使用 queue() 启用任务队列，确保任务在后台继续运行
         # max_size=1 确保只有一个任务在运行
         # Gradio 的 queue() 默认支持后台任务，即使前端关闭也不会中断
-        demo.queue(max_size=1, default_concurrency_limit=1).launch(
+        # 增加队列大小，允许其他请求（如停止、刷新）在处理转换任务时也能响应
+        # max_size=3 允许最多 3 个并发请求，确保停止按钮和刷新按钮可以响应
+        demo.queue(max_size=3, default_concurrency_limit=2).launch(
             server_name="0.0.0.0", 
             server_port=7860, 
             show_error=True,
@@ -1098,7 +1123,8 @@ if __name__ == "__main__":
     except ValueError as e:
         if "shareable link" in str(e):
             print("Fallback: Using share=True due to network restrictions")
-            demo.queue(max_size=1, default_concurrency_limit=1).launch(
+            # 增加队列大小，允许其他请求（如停止、刷新）在处理转换任务时也能响应
+            demo.queue(max_size=3, default_concurrency_limit=2).launch(
                 server_name="0.0.0.0", 
                 server_port=7860, 
                 show_error=True, 
