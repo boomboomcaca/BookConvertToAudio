@@ -388,7 +388,21 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             
             MAX_DURATION_SEC = 45 * 60  # 45 minutes
             
-            full_audio_tensor = torch.cat(all_audio, dim=1)
+            # 在音频片段之间添加短暂停顿，使过渡更自然
+            PAUSE_DURATION_MS = 200  # 停顿时长（毫秒），可调整
+            sample_rate = cosyvoice_model.sample_rate
+            pause_samples = int(sample_rate * PAUSE_DURATION_MS / 1000)
+            silence = torch.zeros(1, pause_samples)
+            
+            # 拼接音频片段，每个片段之间插入停顿
+            audio_with_pauses = []
+            for idx, audio_chunk in enumerate(all_audio):
+                audio_with_pauses.append(audio_chunk)
+                # 最后一个片段后不加停顿
+                if idx < len(all_audio) - 1:
+                    audio_with_pauses.append(silence)
+            
+            full_audio_tensor = torch.cat(audio_with_pauses, dim=1)
             total_samples = full_audio_tensor.shape[1]
             sample_rate = cosyvoice_model.sample_rate
             max_samples = MAX_DURATION_SEC * sample_rate
@@ -1115,7 +1129,7 @@ if __name__ == "__main__":
         # max_size=3 允许最多 3 个并发请求，确保停止按钮和刷新按钮可以响应
         demo.queue(max_size=3, default_concurrency_limit=2).launch(
             server_name="0.0.0.0", 
-            server_port=7860, 
+            server_port=7860,
             show_error=True,
             quiet=False,
             inbrowser=False
