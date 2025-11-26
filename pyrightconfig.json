@@ -8,17 +8,15 @@
     "**/.*"
   ],
   "pythonVersion": "3.10",
-  "pythonPlatform": "Linux",
+  "pythonPlatform": "Windows",
   "typeCheckingMode": "basic",
   "reportMissingImports": "warning",
   "reportMissingTypeStubs": false,
-  "venvPath": "/home/boom/miniconda3/envs",
-  "venv": "cosyvoice",
   "executionEnvironments": [
     {
       "root": ".",
       "pythonVersion": "3.10",
-      "pythonPlatform": "Linux",
+      "pythonPlatform": "Windows",
       "extraPaths": [
         "CosyVoice",
         "CosyVoice/third_party/Matcha-TTS"
