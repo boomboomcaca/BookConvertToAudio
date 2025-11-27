@@ -320,13 +320,81 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             from cosyvoice.utils.file_utils import load_wav
             prompt_speech_16k = load_wav(ref_audio_path, 16000)
 
-            all_audio = []
             start_time = time.time()
             
-            # 3. 开始推理
+            # 3. 初始化流式累积变量
             chunk_count = 0
             estimated_chunks = max(1, len(full_text) // 10)
             
+            current_part_audio = []
+            current_part_samples = 0
+            part_index = 0
+            MAX_DURATION_SEC = 45 * 60  # 45 minutes
+            sample_rate = cosyvoice_model.sample_rate
+            MAX_SAMPLES = MAX_DURATION_SEC * sample_rate
+            
+            PAUSE_DURATION_MS = 200
+            pause_samples = int(sample_rate * PAUSE_DURATION_MS / 1000)
+            silence = torch.zeros(1, pause_samples)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            base_filename = os.path.splitext(file_name)[0]
+
+            # 定义内部保存函数
+            def save_current_part(audio_chunks, p_idx):
+                if not audio_chunks:
+                    return
+                
+                # 拼接片段和停顿
+                audio_with_pauses = []
+                for idx, chunk in enumerate(audio_chunks):
+                    audio_with_pauses.append(chunk)
+                    if idx < len(audio_chunks) - 1:
+                        audio_with_pauses.append(silence)
+                
+                full_part_tensor = torch.cat(audio_with_pauses, dim=1)
+                
+                # 生成文件名
+                part_suffix = f"_part{p_idx + 1}"
+                output_base = f"{base_filename}_{timestamp}{part_suffix}"
+                temp_wav = os.path.join(current_dir, f"temp_{output_base}.wav")
+                output_mp4 = f"{output_base}.mp4"
+                mp4_path = os.path.join(OUTPUT_DIR, output_mp4)
+                
+                torchaudio.save(temp_wav, full_part_tensor, sample_rate)
+                
+                # FFmpeg 转换
+                msg = f"File {file_idx + 1}/{total_files}: Converting part {p_idx + 1} to video..."
+                task_state['message'] = msg
+                save_task_state(task_state)
+                
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=black:s=320x240:r=1",
+                    "-i", temp_wav,
+                    "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-crf", "40", "-preset", "veryfast",
+                    "-c:a", "aac", "-b:a", "64k",
+                    "-shortest",
+                    mp4_path
+                ]
+                
+                process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                if os.path.exists(temp_wav):
+                    os.remove(temp_wav)
+
+                if process.returncode != 0:
+                     stderr_text = process.stderr.decode(errors='ignore').strip()
+                     error_msg = f"FFmpeg error part {p_idx + 1}: {stderr_text}"
+                     print(error_msg)
+                     msg = f"File {file_idx + 1}/{total_files}: Video generation failed for part {p_idx + 1}. Details: {stderr_text}"
+                     task_state['message'] = msg
+                     save_task_state(task_state)
+                else:
+                    all_generated_files.append(mp4_path)
+                    task_state['generated_files'] = all_generated_files.copy()
+                    save_task_state(task_state)
+
             try:
                 for i, output in enumerate(cosyvoice_model.inference_zero_shot(full_text, prompt_text, prompt_speech_16k, stream=False)):
                     # 检查停止标志
@@ -339,17 +407,36 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                         break
                     
                     chunk_count += 1
-                    duration = output['tts_speech'].shape[1] / 24000
+                    audio_chunk = output['tts_speech']
+                    chunk_len = audio_chunk.shape[1]
+                    duration = chunk_len / sample_rate
+                    
                     msg = f"File {file_idx + 1}/{total_files}: Generated chunk {chunk_count} ({duration:.2f}s)..."
                     
-                    # 计算当前文件内的进度 (0.0 - 0.9)，预留 0.1 给视频转换
-                    file_progress = min(0.9, chunk_count / estimated_chunks)
+                    # 进度条逻辑
+                    file_progress = min(0.95, chunk_count / estimated_chunks)
                     global_progress = (file_idx + file_progress) / total_files
                     task_state['message'] = msg
                     task_state['progress'] = global_progress
                     save_task_state(task_state)
                     
-                    all_audio.append(output['tts_speech'])
+                    # 累积音频
+                    if current_part_audio:
+                        current_part_samples += pause_samples  # 只有在片段之间才插入停顿
+                    current_part_audio.append(audio_chunk)
+                    current_part_samples += chunk_len
+                    
+                    # 检查是否达到分段阈值
+                    if current_part_samples >= MAX_SAMPLES:
+                        save_current_part(current_part_audio, part_index)
+                        part_index += 1
+                        current_part_audio = []
+                        current_part_samples = 0
+                        
+                        # 强制清理一下内存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
             except Exception as e:
                 if stop_flag.is_set():
                     msg = "转换已停止"
@@ -370,107 +457,13 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 _cleanup_model_immediate()
                 return
 
-            if not all_audio:
+            # 保存剩余的部分
+            if current_part_audio:
+                save_current_part(current_part_audio, part_index)
+            elif chunk_count == 0:
                 msg = f"File {file_idx + 1}/{total_files}: Error: No audio generated for {file_name}"
                 task_state['message'] = msg
                 save_task_state(task_state)
-                continue
-
-            # 4. 处理结果（按最大时长拆分）
-            if stop_flag.is_set():
-                msg = "转换已停止"
-                task_state['status'] = 'stopped'
-                task_state['message'] = msg
-                save_task_state(task_state)
-                print("处理结果前检测到停止标志，开始清理模型...")
-                _cleanup_model_immediate()
-                return
-            
-            MAX_DURATION_SEC = 45 * 60  # 45 minutes
-            
-            # 在音频片段之间添加短暂停顿，使过渡更自然
-            PAUSE_DURATION_MS = 200  # 停顿时长（毫秒），可调整
-            sample_rate = cosyvoice_model.sample_rate
-            pause_samples = int(sample_rate * PAUSE_DURATION_MS / 1000)
-            silence = torch.zeros(1, pause_samples)
-            
-            # 拼接音频片段，每个片段之间插入停顿
-            audio_with_pauses = []
-            for idx, audio_chunk in enumerate(all_audio):
-                audio_with_pauses.append(audio_chunk)
-                # 最后一个片段后不加停顿
-                if idx < len(all_audio) - 1:
-                    audio_with_pauses.append(silence)
-            
-            full_audio_tensor = torch.cat(audio_with_pauses, dim=1)
-            total_samples = full_audio_tensor.shape[1]
-            sample_rate = cosyvoice_model.sample_rate
-            max_samples = MAX_DURATION_SEC * sample_rate
-            
-            num_parts = (total_samples + max_samples - 1) // max_samples
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
-            # 使用文件名作为输出前缀
-            base_filename = os.path.splitext(file_name)[0]
-            
-            for i in range(num_parts):
-                if stop_flag.is_set():
-                    msg = "转换已停止"
-                    task_state['status'] = 'stopped'
-                    task_state['message'] = msg
-                    save_task_state(task_state)
-                    print("处理文件分片时检测到停止标志，开始清理模型...")
-                    _cleanup_model_immediate()
-                    return
-                
-                part_progress = (file_idx + (i / num_parts)) / total_files
-                
-                start = i * max_samples
-                end = min((i + 1) * max_samples, total_samples)
-                part_tensor = full_audio_tensor[:, start:end]
-                
-                part_suffix = f"_part{i+1}" if num_parts > 1 else ""
-                output_base = f"{base_filename}_{timestamp}{part_suffix}"
-                
-                temp_wav = os.path.join(current_dir, f"temp_{output_base}.wav")
-                output_mp4 = f"{output_base}.mp4"
-                mp4_path = os.path.join(OUTPUT_DIR, output_mp4)
-                
-                torchaudio.save(temp_wav, part_tensor, sample_rate)
-                
-                # 5. 生成视频 (FFmpeg)
-                msg = f"File {file_idx + 1}/{total_files}: Converting part {i+1}/{num_parts} to video..."
-                part_progress = (file_idx + (i / num_parts)) / total_files
-                task_state['message'] = msg
-                task_state['progress'] = part_progress
-                save_task_state(task_state)
-                
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "lavfi", "-i", "color=c=black:s=320x240:r=1",
-                    "-i", temp_wav,
-                    "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-crf", "40", "-preset", "veryfast",
-                    "-c:a", "aac", "-b:a", "64k",
-                    "-shortest",
-                    mp4_path
-                ]
-                
-                process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                if os.path.exists(temp_wav):
-                    os.remove(temp_wav)
-
-                if process.returncode != 0:
-                     error_msg = f"FFmpeg error part {i+1}: {process.stderr.decode()}"
-                     print(error_msg)
-                     msg = f"File {file_idx + 1}/{total_files}: Video generation failed for part {i+1}."
-                     task_state['message'] = msg
-                     save_task_state(task_state)
-                else:
-                    # 保存完整路径到输出文件夹
-                    all_generated_files.append(mp4_path)
-                    task_state['generated_files'] = all_generated_files.copy()
-                    save_task_state(task_state)
             
             file_time = time.time() - start_time
             msg = f"File {file_idx + 1}/{total_files}: Done ({file_time:.2f}s)"
