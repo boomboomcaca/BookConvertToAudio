@@ -1,13 +1,19 @@
-import gradio as gr
+import gradio as gradio_module
+import inspect
 import os
 import sys
-import torch
-import torchaudio
 import time
 import subprocess
 import threading
 import json
+import traceback
 from datetime import datetime
+from typing import Any, cast
+
+import torch  # type: ignore[import]
+import torchaudio  # type: ignore[import]
+
+gr = cast(Any, gradio_module)
 
 # 设置环境路径
 current_dir = os.getcwd()
@@ -25,7 +31,7 @@ os.environ["DS_SKIP_CUDA_CHECK"] = "1"
 os.environ["DS_BUILD_OPS"] = "0"
 
 # 全局模型变量
-cosyvoice_model = None
+cosyvoice_model: Any = None
 
 # 停止标志
 stop_flag = threading.Event()
@@ -39,6 +45,14 @@ background_task_lock = threading.Lock()
 ASSETS_DIR = os.path.join(current_dir, 'assets')
 if not os.path.exists(ASSETS_DIR):
     os.makedirs(ASSETS_DIR)
+
+# 日志目录
+LOG_DIR = os.path.join(current_dir, 'logs')
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+# 全局日志文件路径（与原有变量名保持一致，方便后续引用）
+log_path = os.path.join(LOG_DIR, 'web_book_converter.log')
 
 # 输出目录（生成的文件保存到这里）
 OUTPUT_DIR = os.path.join(current_dir, 'output')
@@ -121,13 +135,29 @@ def load_model():
             model_dir = os.path.join(cosyvoice_root, 'pretrained_models', 'CosyVoice2-0.5B')
             print(f"Loading model from {model_dir}...")
             
+            def _supports_parameter(param_name: str) -> bool:
+                """检查 CosyVoice 构造函数是否支持给定参数"""
+                try:
+                    return param_name in inspect.signature(CosyVoiceCls).parameters
+                except (TypeError, ValueError):
+                    return False
+
+            def _build_kwargs(fp16: bool) -> dict[str, Any]:
+                kwargs: dict[str, Any] = {
+                    "load_jit": False,
+                    "load_trt": False,
+                    "fp16": fp16,
+                }
+                if _supports_parameter("load_vllm"):
+                    kwargs["load_vllm"] = False
+                return kwargs
+
             try:
-                # 尝试加载
-                cosyvoice_model = CosyVoiceCls(model_dir, load_jit=False, load_trt=False, load_vllm=False, fp16=True)
+                cosyvoice_model = CosyVoiceCls(model_dir, **_build_kwargs(True))
                 return "Model loaded successfully (FP16)."
             except Exception as e:
                 print(f"FP16 load failed: {e}, trying FP32...")
-                cosyvoice_model = CosyVoiceCls(model_dir, load_jit=False, load_trt=False, load_vllm=False, fp16=False)
+                cosyvoice_model = CosyVoiceCls(model_dir, **_build_kwargs(False))
                 return "Model loaded successfully (FP32)."
         except Exception as e:
             return f"Error loading model: {str(e)}"
@@ -1161,9 +1191,11 @@ with gr.Blocks(title="CosyVoice Book Converter", theme=gr.themes.Soft(), css=cus
 if __name__ == "__main__":
     print("Starting Web UI...")
     # 使用 0.0.0.0 让服务在所有网络接口上监听
-    import gradio
-    # 尝试禁用 localhost 检查
-    gradio.strings.en["SHARE_LINK_MESSAGE"] = ""
+    strings_attr = getattr(gradio_module, "strings", None)
+    if strings_attr is not None:
+        en_strings = getattr(strings_attr, "en", None)
+        if isinstance(en_strings, dict):
+            en_strings["SHARE_LINK_MESSAGE"] = ""
     try:
         # 使用 queue() 启用任务队列，确保任务在后台继续运行
         # max_size=1 确保只有一个任务在运行
