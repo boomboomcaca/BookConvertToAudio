@@ -45,6 +45,35 @@ OUTPUT_DIR = os.path.join(current_dir, 'output')
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
+# 前端展示的文件数量上限，避免一次性加载过多文件导致页面卡顿
+MAX_FILES_IN_UI = 30
+MAX_FILES_IN_STATUS_MESSAGE = 10
+
+def _limit_files_for_ui(all_files):
+    """仅保留用于前端展示的最近 N 个文件"""
+    if not all_files:
+        return []
+    return all_files[-MAX_FILES_IN_UI:]
+
+def _update_generated_files_state(task_state, all_files):
+    """更新任务状态中的文件列表和总数"""
+    task_state['generated_files'] = _limit_files_for_ui(all_files)
+    task_state['total_generated_files'] = len(all_files)
+
+def _build_completion_message(all_files):
+    """构建简洁的完成信息，避免一次性输出所有文件名导致界面卡顿"""
+    total = len(all_files)
+    if total == 0:
+        return "All done! No files were generated."
+    recent = [os.path.basename(f) for f in all_files[-MAX_FILES_IN_STATUS_MESSAGE:]]
+    message_lines = [f"All done! Generated {total} file(s) in output folder."]
+    if recent:
+        message_lines.append("最近生成：")
+        message_lines.extend(recent)
+    if total > MAX_FILES_IN_STATUS_MESSAGE:
+        message_lines.append("其余文件请在 output 目录查看。")
+    return "\n".join(message_lines)
+
 # 任务状态文件
 TASK_STATE_FILE = os.path.join(current_dir, 'task_state.json')
 # 文件I/O锁，防止并发写入导致文件损坏
@@ -152,7 +181,10 @@ def get_task_status():
     file_idx = state.get('file_idx', 0)
     progress_pct = state.get('progress', 0) * 100
     message = state.get('message', '')
-    generated_files = state.get('generated_files', [])
+    raw_generated_files = state.get('generated_files', [])
+    total_generated = state.get('total_generated_files', len(raw_generated_files))
+    displayed_files = _limit_files_for_ui(raw_generated_files)
+    hidden_count = max(0, total_generated - len(displayed_files))
     
     if status == 'running':
         status_msg = f"🟢 任务运行中\n"
@@ -166,8 +198,6 @@ def get_task_status():
         status_msg = f"✅ 任务已完成\n"
         if message:
             status_msg += f"{message}"
-        if generated_files:
-            status_msg += f"\n已生成 {len(generated_files)} 个文件"
     elif status == 'stopped':
         status_msg = f"🛑 任务已停止\n"
         if message:
@@ -183,10 +213,11 @@ def get_task_status():
     
     # 如果有生成的文件，返回文件列表
     files = None
-    if generated_files:
+    existing_files = []
+    missing_count = 0
+    if displayed_files:
         # 检查文件是否存在（支持相对路径和绝对路径）
-        existing_files = []
-        for f in generated_files:
+        for f in displayed_files:
             # 如果是相对路径，尝试在当前目录查找
             if not os.path.isabs(f):
                 full_path = os.path.join(current_dir, f)
@@ -194,8 +225,25 @@ def get_task_status():
                     existing_files.append(full_path)
             elif os.path.exists(f):
                 existing_files.append(f)
+        missing_count = len(displayed_files) - len(existing_files)
         if existing_files:
             files = existing_files
+    
+    visible_count = len(existing_files)
+    if total_generated > 0:
+        status_msg += f"\n已生成 {total_generated} 个文件"
+        if visible_count > 0:
+            status_msg += f"（仅显示最近 {visible_count} 个"
+            if hidden_count > 0:
+                status_msg += "，更多文件请查看 output 目录"
+            status_msg += "）"
+        elif hidden_count > 0:
+            status_msg += "（最近文件已被移动或删除，请直接在 output 目录查看）"
+        else:
+            status_msg += "（生成的文件已不存在，可能已被移动或删除）"
+    
+    if missing_count > 0 and visible_count > 0:
+        status_msg += f"\n有 {missing_count} 个最近文件已不存在，已自动从列表中移除。"
     
     return status_msg, files
 
@@ -216,7 +264,8 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
         'total_files': 0,
         'progress': 0.0,
         'message': '任务启动中...',
-        'generated_files': []
+        'generated_files': [],
+        'total_generated_files': 0
     }
     save_task_state(task_state)
     
@@ -278,7 +327,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
         
         # 更新任务状态
         task_state['total_files'] = total_files
-        task_state['generated_files'] = []
+        _update_generated_files_state(task_state, all_generated_files)
         save_task_state(task_state)
 
         for file_idx, text_file in enumerate(text_files):
@@ -392,7 +441,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                      save_task_state(task_state)
                 else:
                     all_generated_files.append(mp4_path)
-                    task_state['generated_files'] = all_generated_files.copy()
+                    _update_generated_files_state(task_state, all_generated_files)
                     save_task_state(task_state)
 
             try:
@@ -469,7 +518,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             msg = f"File {file_idx + 1}/{total_files}: Done ({file_time:.2f}s)"
             task_state['message'] = msg
             task_state['progress'] = (file_idx + 1) / total_files
-            task_state['generated_files'] = all_generated_files.copy()
+            _update_generated_files_state(task_state, all_generated_files)
             save_task_state(task_state)
 
         if stop_flag.is_set():
@@ -480,12 +529,11 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
             # 注意：模型清理在 finally 块中统一处理
         else:
             # 显示文件名（不包含完整路径）
-            file_names = [os.path.basename(f) for f in all_generated_files]
-            msg = f"All done! Generated {len(all_generated_files)} file(s) in output folder:\n" + "\n".join(file_names)
+            msg = _build_completion_message(all_generated_files)
             task_state['status'] = 'completed'
             task_state['message'] = msg
             task_state['progress'] = 1.0
-            task_state['generated_files'] = all_generated_files
+            _update_generated_files_state(task_state, all_generated_files)
             save_task_state(task_state)
 
     except Exception as e:
@@ -591,7 +639,8 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
                 'status': 'error',
                 'message': 'Error: No valid text files found. Files may have been deleted or moved.',
                 'progress': 0.0,
-                'generated_files': []
+                'generated_files': [],
+                'total_generated_files': 0
             }
             save_task_state(task_state)
     
@@ -618,7 +667,8 @@ def convert_book(text_files, ref_audio_name, prompt_text, progress=None):
         'total_files': 0,
         'progress': 0.0,
         'message': '任务启动中...',
-        'generated_files': []
+        'generated_files': [],
+        'total_generated_files': 0
     }
     save_task_state(task_state)
     
