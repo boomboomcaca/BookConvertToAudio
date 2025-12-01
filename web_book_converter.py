@@ -447,15 +447,39 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 task_state['message'] = msg
                 save_task_state(task_state)
                 
+                # 获取音频时长，确保视频长度精确匹配，避免末尾静音
+                audio_duration = None
+                try:
+                    probe_cmd = [
+                        "ffprobe", "-v", "error", "-show_entries",
+                        "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                        temp_wav
+                    ]
+                    probe_result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+                    if probe_result.returncode == 0 and probe_result.stdout.strip():
+                        audio_duration = float(probe_result.stdout.strip())
+                except (subprocess.TimeoutExpired, ValueError, Exception) as e:
+                    # 如果获取时长失败，使用 -shortest 作为备选方案
+                    print(f"Warning: Could not get audio duration: {e}, using -shortest instead")
+                
+                # 使用更高的帧率（25 fps）以获得更精确的时长控制
+                # 如果成功获取音频时长，使用 -t 参数精确控制输出时长
                 cmd = [
                     "ffmpeg", "-y",
-                    "-f", "lavfi", "-i", "color=c=black:s=320x240:r=1",
+                    "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25",
                     "-i", temp_wav,
                     "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-crf", "40", "-preset", "veryfast",
                     "-c:a", "aac", "-b:a", "64k",
-                    "-shortest",
-                    mp4_path
                 ]
+                
+                if audio_duration is not None and audio_duration > 0:
+                    # 使用 -t 参数精确限制输出时长，避免末尾静音
+                    cmd.extend(["-t", str(audio_duration)])
+                else:
+                    # 备选方案：使用 -shortest（当无法获取时长时）
+                    cmd.append("-shortest")
+                
+                cmd.append(mp4_path)
                 
                 process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 
