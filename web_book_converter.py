@@ -1123,7 +1123,6 @@ with gr.Blocks(title="CosyVoice Book Converter", theme=gr.themes.Soft(), css=cus
                     label="运行日志", 
                     lines=6, 
                     interactive=False,
-                    show_copy_button=True,
                     container=False,
                     elem_classes=["output-textbox"],
                     scale=4
