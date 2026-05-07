@@ -11,3 +11,6 @@ __pycache__/
 # 任务状态文件
 task_state.json
 
+# 运行时日志
+logs/
+

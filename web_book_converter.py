@@ -32,6 +32,20 @@ os.environ["DS_BUILD_OPS"] = "0"
 
 # 全局模型变量
 cosyvoice_model: Any = None
+# 当前模型版本标识：'v3' / 'v2' / 'v1'，用于在推理时按版本调整 prompt 文本格式
+cosyvoice_model_version: str = ''
+
+# CosyVoice 3 推理时需要在 prompt_text 前添加的系统提示
+COSYVOICE3_SYSTEM_PROMPT = 'You are a helpful assistant.<|endofprompt|>'
+
+# 优先使用的模型目录（按顺序尝试）。CosyVoice3 优先
+COSYVOICE_MODEL_DIR_CANDIDATES = [
+    'Fun-CosyVoice3-0.5B',
+    'CosyVoice2-0.5B',
+    'CosyVoice-300M',
+    'CosyVoice-300M-SFT',
+    'CosyVoice-300M-Instruct',
+]
 
 # 停止标志
 stop_flag = threading.Event()
@@ -119,22 +133,42 @@ def get_prompt_text_for_audio(audio_filename):
             return ""
     return ""
 
+def _resolve_cosyvoice_model_dir() -> str:
+    """按优先级查找已下载的 CosyVoice 模型目录，优先返回 CosyVoice3。"""
+    base_dir = os.path.join(cosyvoice_root, 'pretrained_models')
+    for name in COSYVOICE_MODEL_DIR_CANDIDATES:
+        candidate = os.path.join(base_dir, name)
+        # 任一版本的 yaml 存在即视为有效模型目录
+        for yaml_name in ('cosyvoice3.yaml', 'cosyvoice2.yaml', 'cosyvoice.yaml'):
+            if os.path.exists(os.path.join(candidate, yaml_name)):
+                return candidate
+    # 兜底：返回 CosyVoice3 默认目录（即使不存在，也让后续报错更明确）
+    return os.path.join(base_dir, COSYVOICE_MODEL_DIR_CANDIDATES[0])
+
+
+def _detect_cosyvoice_class(model_dir: str):
+    """根据 model_dir 中的 yaml 文件选择匹配的 CosyVoice 类与版本号。"""
+    if os.path.exists(os.path.join(model_dir, 'cosyvoice3.yaml')):
+        from cosyvoice.cli.cosyvoice import CosyVoice3 as CosyVoiceCls
+        return CosyVoiceCls, 'v3', 'CosyVoice3'
+    if os.path.exists(os.path.join(model_dir, 'cosyvoice2.yaml')):
+        from cosyvoice.cli.cosyvoice import CosyVoice2 as CosyVoiceCls
+        return CosyVoiceCls, 'v2', 'CosyVoice2'
+    if os.path.exists(os.path.join(model_dir, 'cosyvoice.yaml')):
+        from cosyvoice.cli.cosyvoice import CosyVoice as CosyVoiceCls
+        return CosyVoiceCls, 'v1', 'CosyVoice'
+    raise FileNotFoundError(f"No valid cosyvoice*.yaml found in {model_dir}")
+
+
 def load_model():
-    global cosyvoice_model
+    global cosyvoice_model, cosyvoice_model_version
     if cosyvoice_model is None:
         try:
-            # 尝试适配不同的代码版本
-            try:
-                from cosyvoice.cli.cosyvoice import CosyVoice2 as CosyVoiceCls
-                print("Detected CosyVoice2 class.")
-            except ImportError:
-                from cosyvoice.cli.cosyvoice import CosyVoice as CosyVoiceCls
-                print("Detected CosyVoice class.")
-
-            # 指向刚下载的 CosyVoice2-0.5B
-            model_dir = os.path.join(cosyvoice_root, 'pretrained_models', 'CosyVoice2-0.5B')
+            model_dir = _resolve_cosyvoice_model_dir()
+            CosyVoiceCls, version, class_name = _detect_cosyvoice_class(model_dir)
+            print(f"Detected {class_name} class.")
             print(f"Loading model from {model_dir}...")
-            
+
             def _supports_parameter(param_name: str) -> bool:
                 """检查 CosyVoice 构造函数是否支持给定参数"""
                 try:
@@ -143,22 +177,22 @@ def load_model():
                     return False
 
             def _build_kwargs(fp16: bool) -> dict[str, Any]:
-                kwargs: dict[str, Any] = {
-                    "load_jit": False,
-                    "load_trt": False,
-                    "fp16": fp16,
-                }
-                if _supports_parameter("load_vllm"):
-                    kwargs["load_vllm"] = False
+                # CosyVoice3 不再支持 load_jit；仅在签名中存在时才传入对应参数
+                kwargs: dict[str, Any] = {"fp16": fp16}
+                for key in ("load_jit", "load_trt", "load_vllm"):
+                    if _supports_parameter(key):
+                        kwargs[key] = False
                 return kwargs
 
             try:
                 cosyvoice_model = CosyVoiceCls(model_dir, **_build_kwargs(True))
-                return "Model loaded successfully (FP16)."
+                cosyvoice_model_version = version
+                return f"{class_name} loaded successfully (FP16)."
             except Exception as e:
                 print(f"FP16 load failed: {e}, trying FP32...")
                 cosyvoice_model = CosyVoiceCls(model_dir, **_build_kwargs(False))
-                return "Model loaded successfully (FP32)."
+                cosyvoice_model_version = version
+                return f"{class_name} loaded successfully (FP32)."
         except Exception as e:
             return f"Error loading model: {str(e)}"
     return "Model already loaded."
@@ -396,8 +430,16 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 _cleanup_model_immediate()
                 break
             
-            from cosyvoice.utils.file_utils import load_wav
-            prompt_speech_16k = load_wav(ref_audio_path, 16000)
+            # 注意：CosyVoiceFrontEnd 内部会再次调用 load_wav(prompt_wav, ...)，
+            # 因此必须传入「音频文件路径」而非已加载的 Tensor，否则 torchaudio.load 会因
+            # 接收到 Tensor 抛出 "Invalid file: tensor(...)" 错误。
+            prompt_wav_for_inference = ref_audio_path
+
+            # CosyVoice 3 要求 prompt_text 形如 "You are a helpful assistant.<|endofprompt|>{ref_text}"
+            # 当用户未提供 system 段时自动补齐，避免推理质量下降
+            effective_prompt_text = prompt_text or ''
+            if cosyvoice_model_version == 'v3' and '<|endofprompt|>' not in effective_prompt_text:
+                effective_prompt_text = COSYVOICE3_SYSTEM_PROMPT + effective_prompt_text
 
             start_time = time.time()
             
@@ -499,7 +541,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                     save_task_state(task_state)
 
             try:
-                for i, output in enumerate(cosyvoice_model.inference_zero_shot(full_text, prompt_text, prompt_speech_16k, stream=False)):
+                for i, output in enumerate(cosyvoice_model.inference_zero_shot(full_text, effective_prompt_text, prompt_wav_for_inference, stream=False)):
                     # 检查停止标志
                     if stop_flag.is_set():
                         msg = "转换已停止，正在清理资源..."
@@ -1082,8 +1124,8 @@ custom_css = """
     }
 """
 
-with gr.Blocks(title="CosyVoice Book Converter", theme=gr.themes.Soft(), css=custom_css) as demo:
-    gr.Markdown("### 📚 CosyVoice 有声书转换器")
+with gr.Blocks(title="CosyVoice3 Book Converter", theme=gr.themes.Soft(), css=custom_css) as demo:
+    gr.Markdown("### 📚 CosyVoice 3 有声书转换器")
     
     with gr.Row(equal_height=False):
         with gr.Column(scale=1, min_width=280):
