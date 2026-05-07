@@ -38,6 +38,9 @@ cosyvoice_model_version: str = ''
 # CosyVoice 3 推理时需要在 prompt_text 前添加的系统提示
 COSYVOICE3_SYSTEM_PROMPT = 'You are a helpful assistant.<|endofprompt|>'
 
+# 是否优先加载 RL 微调过的 LLM 权重（llm.rl.pt）：质量明显优于 base llm.pt（CER 0.81% vs 1.21%）
+USE_RL_LLM_IF_AVAILABLE = True
+
 # 优先使用的模型目录（按顺序尝试）。CosyVoice3 优先
 COSYVOICE_MODEL_DIR_CANDIDATES = [
     'Fun-CosyVoice3-0.5B',
@@ -146,6 +149,37 @@ def _resolve_cosyvoice_model_dir() -> str:
     return os.path.join(base_dir, COSYVOICE_MODEL_DIR_CANDIDATES[0])
 
 
+def _try_load_rl_llm(model_dir: str) -> bool:
+    """若存在 llm.rl.pt 且开启开关，则将其权重覆盖到已初始化的 cosyvoice_model.model.llm 上。
+
+    返回是否成功加载 RL 权重。
+    """
+    global cosyvoice_model
+    if not USE_RL_LLM_IF_AVAILABLE or cosyvoice_model is None:
+        return False
+    rl_path = os.path.join(model_dir, 'llm.rl.pt')
+    if not os.path.exists(rl_path):
+        return False
+    try:
+        inner = getattr(cosyvoice_model, 'model', None)
+        llm_module = getattr(inner, 'llm', None) if inner is not None else None
+        device = getattr(inner, 'device', None) if inner is not None else None
+        if llm_module is None:
+            print('[RL-LLM] cosyvoice_model.model.llm 不存在，跳过 RL 权重加载')
+            return False
+        print(f'[RL-LLM] Loading RL fine-tuned LLM weights from {rl_path}...')
+        state_dict = torch.load(rl_path, map_location=device or 'cpu', weights_only=True)
+        llm_module.load_state_dict(state_dict, strict=True)
+        if device is not None:
+            llm_module.to(device)
+        llm_module.eval()
+        print('[RL-LLM] RL weights loaded successfully.')
+        return True
+    except Exception as e:
+        print(f'[RL-LLM] Failed to load RL weights, falling back to base LLM: {e}')
+        return False
+
+
 def _detect_cosyvoice_class(model_dir: str):
     """根据 model_dir 中的 yaml 文件选择匹配的 CosyVoice 类与版本号。"""
     if os.path.exists(os.path.join(model_dir, 'cosyvoice3.yaml')):
@@ -184,15 +218,21 @@ def load_model():
                         kwargs[key] = False
                 return kwargs
 
+            precision = ''
             try:
                 cosyvoice_model = CosyVoiceCls(model_dir, **_build_kwargs(True))
                 cosyvoice_model_version = version
-                return f"{class_name} loaded successfully (FP16)."
+                precision = 'FP16'
             except Exception as e:
                 print(f"FP16 load failed: {e}, trying FP32...")
                 cosyvoice_model = CosyVoiceCls(model_dir, **_build_kwargs(False))
                 cosyvoice_model_version = version
-                return f"{class_name} loaded successfully (FP32)."
+                precision = 'FP32'
+
+            # 加载完成后尝试用 RL 微调后的 LLM 权重覆盖，明显提升内容准确率
+            rl_loaded = _try_load_rl_llm(model_dir)
+            llm_tag = 'RL-LLM' if rl_loaded else 'base-LLM'
+            return f"{class_name} loaded successfully ({precision}, {llm_tag})."
         except Exception as e:
             return f"Error loading model: {str(e)}"
     return "Model already loaded."
@@ -511,7 +551,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                     "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25",
                     "-i", temp_wav,
                     "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-crf", "40", "-preset", "veryfast",
-                    "-c:a", "aac", "-b:a", "64k",
+                    "-c:a", "aac", "-b:a", "96k",
                 ]
                 
                 if audio_duration is not None and audio_duration > 0:
