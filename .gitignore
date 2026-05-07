@@ -14,3 +14,7 @@ task_state.json
 # 运行时日志
 logs/
 
+# TensorRT 编译产物（GPU/驱动/TRT 版本绑定，体积大且不可移植）
+*.plan
+*.engine
+

@@ -9,7 +9,7 @@ CONDA_BASE="/home/boom/miniconda3"
 
 # 激活 conda 环境
 source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate cosyvoice
+conda activate cosyvoice310
 
 # 运行 Python 脚本，禁用输出缓冲
 python -u web_book_converter.py
