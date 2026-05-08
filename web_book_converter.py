@@ -553,7 +553,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                         "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
                         temp_wav
                     ]
-                    probe_result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+                    probe_result = subprocess.run(probe_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
                     if probe_result.returncode == 0 and probe_result.stdout.strip():
                         audio_duration = float(probe_result.stdout.strip())
                 except (subprocess.TimeoutExpired, ValueError, Exception) as e:
@@ -563,7 +563,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 # 使用更高的帧率（25 fps）以获得更精确的时长控制
                 # 如果成功获取音频时长，使用 -t 参数精确控制输出时长
                 cmd = [
-                    "ffmpeg", "-y",
+                    "ffmpeg", "-y", "-nostdin",
                     "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25",
                     "-i", temp_wav,
                     "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-crf", "40", "-preset", "veryfast",
@@ -579,7 +579,10 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                 
                 cmd.append(mp4_path)
                 
-                process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # NOTE: 必须传 stdin=DEVNULL,否则后台启动(start.sh &)时 ffmpeg 会因尝试读取
+                # 父进程 stdin 触发 SIGTTIN 进入 T(stopped) 暂停状态,导致整段转换无限期挂起。
+                # 同时在 cmd 中加 -nostdin 作为第二道防线。
+                process = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 
                 if os.path.exists(temp_wav):
                     os.remove(temp_wav)
@@ -1309,6 +1312,167 @@ with gr.Blocks(title="CosyVoice3 Book Converter", theme=gr.themes.Soft(), css=cu
         # 用户可以使用手动刷新按钮
         pass
 
+def _build_cosyvoice_api_demo(cosyvoice):
+    """构建一个最小化的 Gradio Blocks,仅作为 pyvideotrans 等客户端的 API 通道。
+
+    - UI 装饰(Markdown / Row / Column / 标签提示)全部去掉
+    - 但保留 input/output 组件的类型与顺序,**严格匹配官方 CosyVoice/webui.py 的 generate_button.click 签名**
+    - seed_button.click 仍注册在 generate_button.click 之前,保证 generate_audio 的 fn_index 与官方一致(=1)
+    - 内置 CosyVoice3 必需的 `<|endofprompt|>` 注入及 `inference_instruct2` 切换
+    """
+    import random as _random
+    import numpy as _np
+    from cosyvoice.utils.file_utils import logging as _logging  # type: ignore[import]
+    from cosyvoice.utils.common import set_all_random_seed as _set_seed  # type: ignore[import]
+
+    inference_mode_list = ['3s极速复刻', '预训练音色', '跨语种复刻', '自然语言控制']
+    stream_mode_list = [('否', False), ('是', True)]
+    prompt_sr = 16000
+    sft_spk = cosyvoice.list_available_spks() or ['']
+    default_data = _np.zeros(cosyvoice.sample_rate)
+
+    is_cv3 = cosyvoice.__class__.__name__ == 'CosyVoice3'
+    eop_prefix = 'You are a helpful assistant.<|endofprompt|>'
+
+    def _generate_seed():
+        return {"__type__": "update", "value": _random.randint(1, 100000000)}
+
+    def _generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text,
+                        prompt_wav_upload, prompt_wav_record, instruct_text,
+                        seed, stream, speed):
+        if prompt_wav_upload is not None:
+            prompt_wav = prompt_wav_upload
+        elif prompt_wav_record is not None:
+            prompt_wav = prompt_wav_record
+        else:
+            prompt_wav = None
+
+        if mode_checkbox_group in ['3s极速复刻', '跨语种复刻']:
+            if prompt_wav is None:
+                gr.Warning('prompt 音频为空，请提供 prompt 音频')
+                yield (cosyvoice.sample_rate, default_data)
+                return
+            try:
+                # cast(Any, torchaudio).info 等价于 torchaudio.info,运行时无差异;
+                # 仅用于绕过 torchaudio 类型 stub 不全导致的 Pyright 误报
+                actual_sr = cast(Any, torchaudio).info(prompt_wav).sample_rate
+                if actual_sr < prompt_sr:
+                    gr.Warning(f'prompt 音频采样率 {actual_sr} 低于 {prompt_sr}')
+                    yield (cosyvoice.sample_rate, default_data)
+                    return
+            except Exception:
+                pass
+
+        if mode_checkbox_group == '预训练音色':
+            if sft_dropdown == '':
+                gr.Warning('没有可用的预训练音色')
+                yield (cosyvoice.sample_rate, default_data)
+                return
+            _logging.info('get sft inference request')
+            _set_seed(seed)
+            for i in cosyvoice.inference_sft(tts_text, sft_dropdown, stream=stream, speed=speed):
+                yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        elif mode_checkbox_group == '3s极速复刻':
+            if prompt_text == '':
+                gr.Warning('prompt 文本为空')
+                yield (cosyvoice.sample_rate, default_data)
+                return
+            _logging.info('get zero_shot inference request')
+            _set_seed(seed)
+            if is_cv3 and '<|endofprompt|>' not in prompt_text:
+                prompt_text = eop_prefix + prompt_text
+            for i in cosyvoice.inference_zero_shot(tts_text, prompt_text, prompt_wav, stream=stream, speed=speed):
+                yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        elif mode_checkbox_group == '跨语种复刻':
+            _logging.info('get cross_lingual inference request')
+            _set_seed(seed)
+            if is_cv3 and '<|endofprompt|>' not in tts_text:
+                tts_text = eop_prefix + tts_text
+            for i in cosyvoice.inference_cross_lingual(tts_text, prompt_wav, stream=stream, speed=speed):
+                yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+        else:
+            if instruct_text == '':
+                gr.Warning('请输入 instruct 文本')
+                yield (cosyvoice.sample_rate, default_data)
+                return
+            _logging.info('get instruct inference request')
+            _set_seed(seed)
+            if is_cv3:
+                it = instruct_text if '<|endofprompt|>' in instruct_text else (instruct_text + '<|endofprompt|>')
+                for i in cosyvoice.inference_instruct2(tts_text, it, prompt_wav, stream=stream, speed=speed):
+                    yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+            else:
+                for i in cosyvoice.inference_instruct(tts_text, sft_dropdown, instruct_text, stream=stream, speed=speed):
+                    yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
+
+    # 极简 Blocks:只保留 API 必需的组件,且顺序/类型严格对齐官方 webui.py
+    with gr.Blocks(title="CosyVoice API (headless)") as demo:
+        tts_text = gr.Textbox(label="tts_text", value="")
+        mode_checkbox_group = gr.Radio(choices=inference_mode_list, value=inference_mode_list[0], label="mode")
+        sft_dropdown = gr.Dropdown(choices=sft_spk, value=sft_spk[0], label="sft_dropdown")
+        stream_radio = gr.Radio(choices=stream_mode_list, value=False, label="stream")
+        speed = gr.Number(value=1.0, label="speed", minimum=0.5, maximum=2.0, step=0.1)
+        seed_button = gr.Button(value="\U0001F3B2")
+        seed = gr.Number(value=0, label="seed")
+        prompt_wav_upload = gr.Audio(sources='upload', type='filepath', label="prompt_wav_upload")
+        prompt_wav_record = gr.Audio(sources='microphone', type='filepath', label="prompt_wav_record")
+        prompt_text = gr.Textbox(label="prompt_text", value="")
+        instruct_text = gr.Textbox(label="instruct_text", value="")
+        generate_button = gr.Button("生成音频")
+        # NOTE: 必须 streaming=False。streaming=True 会让 Gradio 以 HLS/ADTS(m3u8+AAC)
+        # 分片形式返回音频, pyvideotrans 通过 gradio_client 调用时只能解析单个 wav 文件,
+        # 收到 m3u8 后会把每条 TTS 都判为失败, 触发 "[CosyVoice(本地)] 配音全部失败 None"。
+        # 详见 https://pyvideotrans.com/cosyvoice 中的"修改版 webui.py"说明。
+        audio_output = gr.Audio(label="audio_output", autoplay=False, streaming=False)
+
+        # NOTE: seed_button.click 必须在 generate_button.click 之前注册,
+        # 让 generate_audio 的 fn_index 与官方 CosyVoice/webui.py 保持一致(=1)。
+        # 同时显式指定 api_name="generate_audio",让 pyvideotrans 等客户端通过
+        # gradio_client 用 api_name='/generate_audio' 调用时能找到端点。
+        seed_button.click(_generate_seed, inputs=[], outputs=seed, api_name="generate_seed")
+        generate_button.click(
+            _generate_audio,
+            inputs=[tts_text, mode_checkbox_group, sft_dropdown, prompt_text,
+                    prompt_wav_upload, prompt_wav_record, instruct_text,
+                    seed, stream_radio, speed],
+            outputs=[audio_output],
+            api_name="generate_audio",
+        )
+    demo.queue(max_size=4, default_concurrency_limit=2)
+    return demo
+
+
+def _launch_cosyvoice_webui_inproc(port: int = 8000):
+    """在同一进程内启动 CosyVoice WebUI 的 API 通道(供 pyvideotrans 等客户端调用)。
+
+    复用已经加载的 cosyvoice_model,共享 GPU 显存与 TRT 引擎;不弹浏览器、不暴露
+    可见 UI,只跑 Gradio 的 /run/predict 等 API endpoint。
+    """
+    global cosyvoice_model
+    if cosyvoice_model is None:
+        print("[CosyVoice WebUI] cosyvoice_model 未初始化,跳过 8000 端口启动")
+        return None
+    try:
+        import tempfile
+        cosy_demo = _build_cosyvoice_api_demo(cosyvoice_model)
+        cosy_demo.launch(
+            server_name='0.0.0.0',
+            server_port=port,
+            show_error=True,
+            inbrowser=False,
+            prevent_thread_lock=True,
+            quiet=True,
+            allowed_paths=[tempfile.gettempdir()],
+        )
+        print(f"[CosyVoice WebUI] API launched on http://0.0.0.0:{port}")
+        return cosy_demo
+    except Exception as exc:  # noqa: BLE001
+        # 8000 端口启动失败不能拖垮 7860 主界面,只打印告警
+        print(f"[CosyVoice WebUI] failed to launch on {port}: {exc}")
+        traceback.print_exc()
+        return None
+
+
 if __name__ == "__main__":
     print("Starting Web UI...")
     # 使用 0.0.0.0 让服务在所有网络接口上监听
@@ -1317,27 +1481,45 @@ if __name__ == "__main__":
         en_strings = getattr(strings_attr, "en", None)
         if isinstance(en_strings, dict):
             en_strings["SHARE_LINK_MESSAGE"] = ""
+
+    # 提前加载 CosyVoice 模型,这样 8000 端口的 API 启动后立即可用(否则要等首次调用)
+    print("Pre-loading CosyVoice model (shared by 7860 GUI and 8000 API)...")
+    print(load_model())
+
+    # 启动 CosyVoice 官方 WebUI(8000),共用同一份模型,供 pyvideotrans 等客户端调用
+    _launch_cosyvoice_webui_inproc(port=8000)
+
     try:
         # 使用 queue() 启用任务队列，确保任务在后台继续运行
-        # max_size=1 确保只有一个任务在运行
-        # Gradio 的 queue() 默认支持后台任务，即使前端关闭也不会中断
-        # 增加队列大小，允许其他请求（如停止、刷新）在处理转换任务时也能响应
         # max_size=3 允许最多 3 个并发请求，确保停止按钮和刷新按钮可以响应
         demo.queue(max_size=3, default_concurrency_limit=2).launch(
-            server_name="0.0.0.0", 
+            server_name="0.0.0.0",
             server_port=7860,
             show_error=True,
             quiet=False,
-            inbrowser=False
+            inbrowser=False,
+            prevent_thread_lock=True,
         )
     except ValueError as e:
         if "shareable link" in str(e):
             print("Fallback: Using share=True due to network restrictions")
-            # 增加队列大小，允许其他请求（如停止、刷新）在处理转换任务时也能响应
             demo.queue(max_size=3, default_concurrency_limit=2).launch(
-                server_name="0.0.0.0", 
-                server_port=7860, 
-                show_error=True, 
+                server_name="0.0.0.0",
+                server_port=7860,
+                show_error=True,
                 share=True,
-                inbrowser=False
+                inbrowser=False,
+                prevent_thread_lock=True,
             )
+        else:
+            raise
+
+    # 主线程阻塞,保持两个 Gradio server 一直运行;systemd 发送 SIGTERM 时直接退出
+    print("Both servers are running:")
+    print("  - Book Converter GUI: http://0.0.0.0:7860")
+    print("  - CosyVoice WebUI API: http://0.0.0.0:8000")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received, shutting down...")

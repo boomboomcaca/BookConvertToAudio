@@ -1,6 +1,7 @@
 [Unit]
-Description=Book Convert To Audio Service
-After=network.target
+Description=Book Converter (7860) + CosyVoice WebUI API (8000) - merged single process
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
