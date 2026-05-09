@@ -1442,58 +1442,35 @@ def _build_cosyvoice_api_demo(cosyvoice):
     return demo
 
 
-def _launch_cosyvoice_webui_inproc(port: int = 8000, max_retries: int = 12, retry_interval: float = 5.0):
+def _launch_cosyvoice_webui_inproc(port: int = 8000):
     """在同一进程内启动 CosyVoice WebUI 的 API 通道(供 pyvideotrans 等客户端调用)。
 
     复用已经加载的 cosyvoice_model,共享 GPU 显存与 TRT 引擎;不弹浏览器、不暴露
     可见 UI,只跑 Gradio 的 /run/predict 等 API endpoint。
-
-    重试策略:
-      - 端口被占用 (EADDRINUSE / OSError) 通常发生在 wsl --shutdown 之后,旧 socket
-        还在 TIME_WAIT(默认 60s),systemd 自动重启会撞上。这里在进程内重试
-        max_retries 次, 每次间隔 retry_interval 秒, 总等待 ~60s 足以覆盖 TIME_WAIT。
-      - 重试全部失败则 sys.exit(1), 由 systemd 的 Restart=always 接管再起一轮。
-      - 其他类型异常 (例如模型未加载) 不重试, 仅打印不退出, 让 7860 仍可用。
     """
     global cosyvoice_model
     if cosyvoice_model is None:
         print("[CosyVoice WebUI] cosyvoice_model 未初始化,跳过 8000 端口启动")
         return None
-    import tempfile
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            cosy_demo = _build_cosyvoice_api_demo(cosyvoice_model)
-            cosy_demo.launch(
-                server_name='0.0.0.0',
-                server_port=port,
-                show_error=True,
-                inbrowser=False,
-                prevent_thread_lock=True,
-                quiet=True,
-                allowed_paths=[tempfile.gettempdir()],
-            )
-            print(f"[CosyVoice WebUI] API launched on http://0.0.0.0:{port} (attempt {attempt}/{max_retries})")
-            return cosy_demo
-        except OSError as exc:
-            # 端口冲突类错误: 等一会重试
-            last_exc = exc
-            print(f"[CosyVoice WebUI] attempt {attempt}/{max_retries} bind {port} failed: {exc}")
-            if attempt < max_retries:
-                print(f"[CosyVoice WebUI] retrying in {retry_interval}s (waiting for TIME_WAIT to clear)...")
-                time.sleep(retry_interval)
-        except Exception as exc:  # noqa: BLE001
-            # 非端口类错误: 不重试, 但也不拖垮 7860
-            print(f"[CosyVoice WebUI] non-bind error on launch: {exc}")
-            traceback.print_exc()
-            return None
-    # 所有重试都失败 -> 主动退出, 让 systemd 接管重启
-    print(
-        f"[CosyVoice WebUI] FATAL: failed to bind {port} after {max_retries} attempts: {last_exc}",
-        file=sys.stderr,
-    )
-    print("[CosyVoice WebUI] exiting so systemd can Restart=always", file=sys.stderr)
-    sys.exit(1)
+    try:
+        import tempfile
+        cosy_demo = _build_cosyvoice_api_demo(cosyvoice_model)
+        cosy_demo.launch(
+            server_name='0.0.0.0',
+            server_port=port,
+            show_error=True,
+            inbrowser=False,
+            prevent_thread_lock=True,
+            quiet=True,
+            allowed_paths=[tempfile.gettempdir()],
+        )
+        print(f"[CosyVoice WebUI] API launched on http://0.0.0.0:{port}")
+        return cosy_demo
+    except Exception as exc:  # noqa: BLE001
+        # 8000 端口启动失败不能拖垮 7860 主界面,只打印告警
+        print(f"[CosyVoice WebUI] failed to launch on {port}: {exc}")
+        traceback.print_exc()
+        return None
 
 
 if __name__ == "__main__":
@@ -1510,8 +1487,7 @@ if __name__ == "__main__":
     print(load_model())
 
     # 启动 CosyVoice 官方 WebUI(8000),共用同一份模型,供 pyvideotrans 等客户端调用
-    # 注意: 失败重试 12 次仍失败的话 _launch_cosyvoice_webui_inproc 会 sys.exit(1)
-    cosyvoice_api_handle = _launch_cosyvoice_webui_inproc(port=8000)
+    _launch_cosyvoice_webui_inproc(port=8000)
 
     try:
         # 使用 queue() 启用任务队列，确保任务在后台继续运行
@@ -1539,12 +1515,9 @@ if __name__ == "__main__":
             raise
 
     # 主线程阻塞,保持两个 Gradio server 一直运行;systemd 发送 SIGTERM 时直接退出
-    print("Servers status:")
-    print("  - Book Converter GUI: http://0.0.0.0:7860 [OK]")
-    if cosyvoice_api_handle is not None:
-        print("  - CosyVoice WebUI API: http://0.0.0.0:8000 [OK]")
-    else:
-        print("  - CosyVoice WebUI API: NOT RUNNING (model not loaded; pyvideotrans cannot connect)")
+    print("Both servers are running:")
+    print("  - Book Converter GUI: http://0.0.0.0:7860")
+    print("  - CosyVoice WebUI API: http://0.0.0.0:8000")
     try:
         while True:
             time.sleep(3600)
