@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 User=boom
 Group=boom
-WorkingDirectory=/mnt/d/Soft/BookConvertToAudio
+WorkingDirectory=/home/boom/BookConvertToAudio
 Environment="PATH=/home/boom/miniconda3/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/bin/bash /mnt/d/Soft/BookConvertToAudio/start.sh
+ExecStart=/bin/bash /home/boom/BookConvertToAudio/start.sh
 Restart=always
 RestartSec=10
 StandardOutput=journal
