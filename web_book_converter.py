@@ -63,6 +63,17 @@ background_task_thread = None
 # 任务管理锁：防止并发请求导致 background_task_thread 被覆盖
 background_task_lock = threading.Lock()
 
+# CosyVoice 模型推理锁，防止并发推理导致 CUDA/模型状态损坏
+cosyvoice_inference_lock = threading.Lock()
+
+def locked_generator(gen, lock):
+    lock.acquire()
+    try:
+        for val in gen:
+            yield val
+    finally:
+        lock.release()
+
 # 资源目录
 ASSETS_DIR = os.path.join(current_dir, 'assets')
 if not os.path.exists(ASSETS_DIR):
@@ -600,7 +611,7 @@ def _execute_conversion_task(text_files, ref_audio_name, prompt_text):
                     save_task_state(task_state)
 
             try:
-                for i, output in enumerate(cosyvoice_model.inference_zero_shot(full_text, effective_prompt_text, prompt_wav_for_inference, stream=False)):
+                for i, output in enumerate(locked_generator(cosyvoice_model.inference_zero_shot(full_text, effective_prompt_text, prompt_wav_for_inference, stream=False), cosyvoice_inference_lock)):
                     # 检查停止标志
                     if stop_flag.is_set():
                         msg = "转换已停止，正在清理资源..."
@@ -1370,7 +1381,7 @@ def _build_cosyvoice_api_demo(cosyvoice):
                 return
             _logging.info('get sft inference request')
             _set_seed(seed)
-            for i in cosyvoice.inference_sft(tts_text, sft_dropdown, stream=stream, speed=speed):
+            for i in locked_generator(cosyvoice.inference_sft(tts_text, sft_dropdown, stream=stream, speed=speed), cosyvoice_inference_lock):
                 yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
         elif mode_checkbox_group == '3s极速复刻':
             if prompt_text == '':
@@ -1381,14 +1392,14 @@ def _build_cosyvoice_api_demo(cosyvoice):
             _set_seed(seed)
             if is_cv3 and '<|endofprompt|>' not in prompt_text:
                 prompt_text = eop_prefix + prompt_text
-            for i in cosyvoice.inference_zero_shot(tts_text, prompt_text, prompt_wav, stream=stream, speed=speed):
+            for i in locked_generator(cosyvoice.inference_zero_shot(tts_text, prompt_text, prompt_wav, stream=stream, speed=speed), cosyvoice_inference_lock):
                 yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
         elif mode_checkbox_group == '跨语种复刻':
             _logging.info('get cross_lingual inference request')
             _set_seed(seed)
             if is_cv3 and '<|endofprompt|>' not in tts_text:
                 tts_text = eop_prefix + tts_text
-            for i in cosyvoice.inference_cross_lingual(tts_text, prompt_wav, stream=stream, speed=speed):
+            for i in locked_generator(cosyvoice.inference_cross_lingual(tts_text, prompt_wav, stream=stream, speed=speed), cosyvoice_inference_lock):
                 yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
         else:
             if instruct_text == '':
@@ -1399,10 +1410,10 @@ def _build_cosyvoice_api_demo(cosyvoice):
             _set_seed(seed)
             if is_cv3:
                 it = instruct_text if '<|endofprompt|>' in instruct_text else (instruct_text + '<|endofprompt|>')
-                for i in cosyvoice.inference_instruct2(tts_text, it, prompt_wav, stream=stream, speed=speed):
+                for i in locked_generator(cosyvoice.inference_instruct2(tts_text, it, prompt_wav, stream=stream, speed=speed), cosyvoice_inference_lock):
                     yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
             else:
-                for i in cosyvoice.inference_instruct(tts_text, sft_dropdown, instruct_text, stream=stream, speed=speed):
+                for i in locked_generator(cosyvoice.inference_instruct(tts_text, sft_dropdown, instruct_text, stream=stream, speed=speed), cosyvoice_inference_lock):
                     yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten())
 
     # 极简 Blocks:只保留 API 必需的组件,且顺序/类型严格对齐官方 webui.py
