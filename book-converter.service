@@ -8,7 +8,7 @@ Type=simple
 User=boom
 Group=boom
 WorkingDirectory=/home/boom/BookConvertToAudio
-Environment="PATH=/home/boom/miniconda3/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=/home/boom/miniconda/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/bin/bash /home/boom/BookConvertToAudio/start.sh
 Restart=always
 RestartSec=10
