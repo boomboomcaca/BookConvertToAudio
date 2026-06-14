@@ -1,4 +1,0 @@
-# Playwright 测试依赖
-playwright>=1.40.0
-pytest-playwright>=0.4.3
-
