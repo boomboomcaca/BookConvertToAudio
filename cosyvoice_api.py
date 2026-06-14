@@ -54,6 +54,18 @@ COSYVOICE_MODEL_DIR_CANDIDATES = [
 # CosyVoice 模型推理锁, 防止并发推理导致 CUDA/模型状态损坏
 cosyvoice_inference_lock = threading.Lock()
 
+# 空闲自动退出: 释放常驻显存给共用 GPU 的其它服务 (stash ASR/翻译/配音)。
+# 空闲 COSY_IDLE_TIMEOUT 秒无推理则进程退出 (os._exit(0)), OS 回收全部显存;
+# dub_server._ensure_cosyvoice() 会在下次请求时按需 systemctl 重启本服务。
+# COSY_IDLE_TIMEOUT <= 0 时关闭该机制 (常驻不退出)。
+IDLE_EXIT_TIMEOUT = float(os.environ.get("COSY_IDLE_TIMEOUT", "600"))
+_last_activity = time.time()
+
+
+def _touch_activity():
+    global _last_activity
+    _last_activity = time.time()
+
 
 def locked_generator(gen, lock):
     # Cross-process GPU serialization: take the shared gpu_lock so book-converter
@@ -71,9 +83,11 @@ def locked_generator(gen, lock):
         lock.acquire()
         try:
             for val in gen:
+                _touch_activity()
                 yield val
         finally:
             lock.release()
+            _touch_activity()
 
 
 def _resolve_cosyvoice_model_dir() -> str:
@@ -373,6 +387,29 @@ def _launch_cosyvoice_webui_inproc(port: int = 8000, max_retries: int = 12, retr
     sys.exit(1)
 
 
+def _start_idle_watchdog(timeout):
+    """空闲 timeout 秒无推理则 os._exit(0) 释放显存; dub_server 会按需重启。timeout<=0 关闭。"""
+    if timeout <= 0:
+        print("[idle-exit] disabled (COSY_IDLE_TIMEOUT<=0)")
+        return
+
+    def _watch():
+        interval = min(30.0, max(5.0, timeout / 4.0))
+        while True:
+            time.sleep(interval)
+            idle = time.time() - _last_activity
+            if idle >= timeout:
+                print(
+                    "[idle-exit] 空闲 %.0fs >= %.0fs, 退出释放显存 (下次请求 dub 会 systemctl 重新拉起)"
+                    % (idle, timeout),
+                    flush=True,
+                )
+                os._exit(0)
+
+    threading.Thread(target=_watch, daemon=True).start()
+    print("[idle-exit] enabled: 空闲 %.0fs 自动退出" % timeout)
+
+
 if __name__ == "__main__":
     print("Starting CosyVoice API (headless, 8000)...")
     # 去掉 gradio 分享链接提示 (headless 不弹 UI)
@@ -397,6 +434,8 @@ if __name__ == "__main__":
 
     print("Server status:")
     print("  - CosyVoice WebUI API: http://0.0.0.0:8000 [OK]")
+    _touch_activity()  # 就绪后再起算空闲, 不把模型加载耗时算进去
+    _start_idle_watchdog(IDLE_EXIT_TIMEOUT)
     # 主线程阻塞, 保持 server 运行; systemd 发送 SIGTERM 时退出
     try:
         while True:

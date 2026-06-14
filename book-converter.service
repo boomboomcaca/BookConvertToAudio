@@ -1,5 +1,5 @@
 [Unit]
-Description=Book Converter (7860) + CosyVoice WebUI API (8000) - merged single process
+Description=CosyVoice WebUI API (8000) - headless
 After=network-online.target
 Wants=network-online.target
 
@@ -9,16 +9,14 @@ User=boom
 Group=boom
 WorkingDirectory=/home/boom/BookConvertToAudio
 Environment="PATH=/home/boom/miniconda/bin:/usr/local/bin:/usr/bin:/bin"
+# 空闲该秒数无推理后进程自动退出释放显存; dub_server 会按需 systemctl 重启。<=0 关闭。
+Environment="COSY_IDLE_TIMEOUT=600"
 ExecStart=/bin/bash /home/boom/BookConvertToAudio/start.sh
-Restart=always
+# on-failure: 崩溃(非0退出)才重启; 空闲清退(退出码0)则保持停止, 把显存让给 stash。
+Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# 可选：设置资源限制
-# LimitNOFILE=65536
-# LimitNPROC=4096
-
 [Install]
 WantedBy=multi-user.target
-
