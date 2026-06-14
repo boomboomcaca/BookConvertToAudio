@@ -330,7 +330,7 @@ def _launch_cosyvoice_webui_inproc(port: int = 8000, max_retries: int = 12, retr
         还在 TIME_WAIT(默认 60s),systemd 自动重启会撞上。这里在进程内重试
         max_retries 次, 每次间隔 retry_interval 秒, 总等待 ~60s 足以覆盖 TIME_WAIT。
       - 重试全部失败则 sys.exit(1), 由 systemd 的 Restart=always 接管再起一轮。
-      - 其他类型异常 (例如模型未加载) 不重试, 仅打印不退出, 让 7860 仍可用。
+      - 其他类型异常 (例如模型未加载) 不重试, 返回 None, 由 __main__ 退出让 systemd 重启。
     """
     global cosyvoice_model
     if cosyvoice_model is None:
@@ -360,7 +360,7 @@ def _launch_cosyvoice_webui_inproc(port: int = 8000, max_retries: int = 12, retr
                 print(f"[CosyVoice WebUI] retrying in {retry_interval}s (waiting for TIME_WAIT to clear)...")
                 time.sleep(retry_interval)
         except Exception as exc:  # noqa: BLE001
-            # 非端口类错误: 不重试, 但也不拖垮 7860
+            # 非端口类错误: 不重试, 返回 None (由 __main__ 退出, systemd Restart=always 接管)
             print(f"[CosyVoice WebUI] non-bind error on launch: {exc}")
             traceback.print_exc()
             return None
